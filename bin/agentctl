@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""
+agentctl: tiny tmux + Codex CLI orchestration helper.
+
+Designed for:
+- spawning many parallel `codex exec` runs in tmux windows (per project)
+- collecting structured outputs via --output-schema / -o
+- emitting a lightweight "done" notification back to a chosen tmux target
+- (optional) resuming a non-interactive session via `codex exec resume <SESSION_ID>`
+
+No external deps. Python 3.9+ recommended.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import random
+import re
+import shlex
+import string
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _short_rand(n: int = 6) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
+def _default_home() -> Path:
+    return Path(os.environ.get("AI_ORCH_HOME", "~/.ai-orch")).expanduser()
+
+
+def _paths(home: Path) -> Dict[str, Path]:
+    return {
+        "home": home,
+        "runs": home / "runs",
+        "projects": home / "projects.json",
+        "config": home / "config.json",
+        "schema": home / "codex_output_schema.json",
+        "notify_log": home / "notify.log",
+    }
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _have_tmux() -> bool:
+    try:
+        subprocess.run(["tmux", "-V"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _tmux_display_message(target: str, msg: str) -> None:
+    if not _have_tmux():
+        return
+    try:
+        subprocess.run(["tmux", "display-message", "-t", target, msg], check=False)
+    except Exception:
+        pass
+
+
+def _tmux_send_keys(target: str, text: str, *, enter: bool = False) -> None:
+    if not _have_tmux():
+        return
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", target, text], check=False)
+        if enter:
+            subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+    except Exception:
+        pass
+
+
+def _current_tmux_session() -> Optional[str]:
+    if not _have_tmux():
+        return None
+    try:
+        out = subprocess.check_output(["tmux", "display-message", "-p", "#S"], text=True).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _safe_tmux_name(s: str, max_len: int = 40) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
+    if not s:
+        s = "run"
+    return s[:max_len]
+
+
+def _read_prompt(prompt_file: str) -> str:
+    if prompt_file == "-":
+        return sys.stdin.read()
+    return Path(prompt_file).expanduser().read_text(encoding="utf-8")
+
+
+def _ensure_init(home: Path) -> Dict[str, Path]:
+    p = _paths(home)
+    p["home"].mkdir(parents=True, exist_ok=True)
+    p["runs"].mkdir(parents=True, exist_ok=True)
+
+    if not p["config"].exists():
+        _save_json(p["config"], {})
+    if not p["projects"].exists():
+        _save_json(p["projects"], {"projects": {}})
+    if not p["schema"].exists():
+        _save_json(
+            p["schema"],
+            {
+                "type": "object",
+                "properties": {
+                    "goal_met": {"type": "boolean"},
+                    "summary": {"type": "string"},
+                    "followup_prompt": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["goal_met", "summary"],
+                "additionalProperties": True,
+            },
+        )
+    if not p["notify_log"].exists():
+        p["notify_log"].write_text("", encoding="utf-8")
+
+    return p
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+
+    session = _current_tmux_session() or os.environ.get("AI_TMUX_SESSION") or "ai"
+    cfg = _load_json(p["config"], {})
+    cfg.setdefault("tmux_session", session)
+    cfg.setdefault("tmux_notify_target", f"{session}:0")  # window 0
+    # If you want true "wake-up" into your Claude/Opus pane, set this to a pane id like "ai:0.0".
+    cfg.setdefault("tmux_sendkeys_target", "")
+    _save_json(p["config"], cfg)
+
+    print("✅ Initialized agentctl workspace:")
+    print(f"  Home:    {p['home']}")
+    print(f"  Runs:    {p['runs']}")
+    print(f"  Config:  {p['config']}")
+    print(f"  Projects:{p['projects']}")
+    print(f"  Schema:  {p['schema']}")
+    print()
+    print("Next:")
+    print("  1) Add projects: agentctl add-project <name> <path> [--default-profile spark]")
+    print("  2) Ensure Codex profiles exist in ~/.codex/config.toml (see answer template).")
+    return 0
+
+
+def cmd_add_project(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    data = _load_json(p["projects"], {"projects": {}})
+
+    proj_path = Path(args.path).expanduser().resolve()
+    if not proj_path.exists():
+        print(f"❌ path does not exist: {proj_path}", file=sys.stderr)
+        return 2
+
+    data.setdefault("projects", {})
+    data["projects"][args.name] = {"path": str(proj_path), "default_profile": args.default_profile}
+    _save_json(p["projects"], data)
+    print(f"✅ added project '{args.name}' -> {proj_path}")
+    return 0
+
+
+def _get_project(name: str, projects_path: Path) -> Dict[str, Any]:
+    data = _load_json(projects_path, {"projects": {}})
+    proj = data.get("projects", {}).get(name)
+    if not proj:
+        raise KeyError(f"Unknown project '{name}'. Add it via: agentctl add-project {name} /path/to/repo")
+    return proj
+
+
+def _write_run_meta(run_dir: Path, meta: Dict[str, Any]) -> None:
+    _save_json(run_dir / "meta.json", meta)
+
+
+def _new_run_id() -> str:
+    return f"{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_short_rand(4)}"
+
+
+def _build_codex_exec_command(
+    *,
+    mode: str,
+    proj_dir: Path,
+    profile: str,
+    schema_path: Path,
+    last_file: Path,
+    ephemeral: bool,
+    full_auto: bool,
+    sandbox: Optional[str],
+    ask_for_approval: Optional[str],
+    model: Optional[str],
+    json_events: bool,
+    skip_git_repo_check: bool,
+    resume_session_id: Optional[str] = None,
+) -> str:
+    """
+    Returns a shell-ready string.
+
+    mode: "exec" or "resume"
+    """
+    parts: list[str] = ["codex", "exec"]
+    if mode == "resume":
+        parts.append("resume")
+        if resume_session_id:
+            parts.append(shlex.quote(resume_session_id))
+
+    parts += ["-C", shlex.quote(str(proj_dir)), "--profile", shlex.quote(profile)]
+
+    if ephemeral:
+        parts.append("--ephemeral")
+    if full_auto:
+        parts.append("--full-auto")
+    if sandbox:
+        parts += ["--sandbox", shlex.quote(sandbox)]
+    if ask_for_approval:
+        parts += ["--ask-for-approval", shlex.quote(ask_for_approval)]
+    if model:
+        parts += ["--model", shlex.quote(model)]
+    if json_events:
+        parts.append("--json")
+    if skip_git_repo_check:
+        parts.append("--skip-git-repo-check")
+
+    parts += ["--output-schema", shlex.quote(str(schema_path)), "-o", shlex.quote(str(last_file))]
+
+    # PROMPT: read from stdin
+    parts.append("-")
+    return " ".join(parts)
+
+
+def _spawn_tmux_window(
+    *,
+    tmux_session: str,
+    window_name: str,
+    cwd: Path,
+    script_path: Path,
+) -> None:
+    if not _have_tmux():
+        raise RuntimeError("tmux not found")
+    subprocess.run(
+        ["tmux", "new-window", "-t", tmux_session, "-n", window_name, "-c", str(cwd), "bash", str(script_path)],
+        check=True,
+    )
+    subprocess.run(["tmux", "set-option", "-t", f"{tmux_session}:{window_name}", "remain-on-exit", "on"], check=False)
+
+
+def _start_common(
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    run_dir: Path,
+    proj_name: str,
+    proj_dir: Path,
+    profile: str,
+    codex_cmd: str,
+    title: str,
+    parent_run_id: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+) -> None:
+    prompt = _read_prompt(args.prompt_file)
+    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+
+    meta = {
+        "run_id": run_id,
+        "title": title or "",
+        "project": proj_name,
+        "project_dir": str(proj_dir),
+        "profile": profile,
+        "created_at": _now_iso(),
+        "status": "running",
+        "mode": "exec" if resume_session_id is None else "resume",
+        "parent_run_id": parent_run_id,
+        "thread_id": resume_session_id,  # filled from events for fresh runs; for resume we already know it
+        "exit_code": None,
+        "ended_at": None,
+        "goal_met": None,
+        "summary": None,
+    }
+    _write_run_meta(run_dir, meta)
+
+    events_file = run_dir / "events.jsonl"
+    stderr_file = run_dir / "stderr.log"
+    prompt_file = run_dir / "prompt.md"
+
+    run_sh = run_dir / "run.sh"
+    run_sh.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -u",
+                f'RUN_ID="{run_id}"',
+                f'PROJECT_DIR="{str(proj_dir)}"',
+                f'RUN_DIR="{str(run_dir)}"',
+                "",
+                'echo "[agentctl] run=$RUN_ID project=$PROJECT_DIR profile=' + profile + '"',
+                "cd \"$PROJECT_DIR\"",
+                "",
+                "set +e",
+                f'{codex_cmd} < "{str(prompt_file)}" > "{str(events_file)}" 2> >(tee "{str(stderr_file)}" >&2)',
+                "EC=$?",
+                "set -e",
+                "",
+                f'python3 "{str(Path(__file__).resolve())}" _on_finish --run-id "$RUN_ID" --exit-code "$EC"',
+                "",
+                'echo ""',
+                'echo "[agentctl] done run=$RUN_ID exit=$EC"',
+                f'echo "[agentctl] artifacts: {str(run_dir)}"',
+                'echo "Drop into a shell for inspection. Type exit to close this tmux window."',
+                'exec "${SHELL:-/bin/bash}" -l',
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_sh.chmod(0o755)
+
+    tmux_session = args.tmux_session
+    window_name = _safe_tmux_name(f"{proj_name}-{profile}-{run_id[-6:]}", max_len=35)
+    _spawn_tmux_window(tmux_session=tmux_session, window_name=window_name, cwd=proj_dir, script_path=run_sh)
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    cfg = _load_json(p["config"], {})
+    proj = _get_project(args.project, p["projects"])
+    proj_dir = Path(proj["path"])
+
+    profile = args.profile or proj.get("default_profile") or "spark"
+    run_id = args.run_id or _new_run_id()
+    run_dir = p["runs"] / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    tmux_session = args.tmux_session or cfg.get("tmux_session") or _current_tmux_session() or "ai"
+    args.tmux_session = tmux_session
+
+    schema_path = Path(args.output_schema).expanduser() if args.output_schema else p["schema"]
+    last_file = run_dir / "last_message.json"
+
+    codex_cmd = _build_codex_exec_command(
+        mode="exec",
+        proj_dir=proj_dir,
+        profile=profile,
+        schema_path=schema_path,
+        last_file=last_file,
+        ephemeral=args.ephemeral,
+        full_auto=args.full_auto,
+        sandbox=args.sandbox,
+        ask_for_approval=args.ask_for_approval,
+        model=args.model,
+        json_events=args.json_events,
+        skip_git_repo_check=args.skip_git_repo_check,
+    )
+
+    _start_common(
+        args=args,
+        run_id=run_id,
+        run_dir=run_dir,
+        proj_name=args.project,
+        proj_dir=proj_dir,
+        profile=profile,
+        codex_cmd=codex_cmd,
+        title=args.title,
+    )
+
+    notify_target = cfg.get("tmux_notify_target", f"{tmux_session}:0")
+    _tmux_display_message(notify_target, f"▶️ Codex started: {run_id} ({args.project}, {profile})")
+    print(run_id)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    cfg = _load_json(p["config"], {})
+
+    parent_run_id = args.parent_run_id
+    parent_dir = p["runs"] / parent_run_id
+    parent_meta_path = parent_dir / "meta.json"
+    if not parent_meta_path.exists():
+        print(f"❌ unknown parent run_id: {parent_run_id}", file=sys.stderr)
+        return 2
+    parent_meta = _load_json(parent_meta_path, {})
+    session_id = parent_meta.get("thread_id")
+    if not session_id:
+        print("❌ parent run has no thread_id (maybe it was --ephemeral or events weren't captured).", file=sys.stderr)
+        return 2
+
+    proj_name = parent_meta.get("project")
+    proj_dir = Path(parent_meta.get("project_dir", "")).expanduser()
+    if not proj_name or not proj_dir.exists():
+        print("❌ could not resolve project from parent run.", file=sys.stderr)
+        return 2
+
+    profile = args.profile or parent_meta.get("profile") or "spark"
+    run_id = args.run_id or _new_run_id()
+    run_dir = p["runs"] / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    tmux_session = args.tmux_session or cfg.get("tmux_session") or _current_tmux_session() or "ai"
+    args.tmux_session = tmux_session
+
+    schema_path = Path(args.output_schema).expanduser() if args.output_schema else p["schema"]
+    last_file = run_dir / "last_message.json"
+
+    codex_cmd = _build_codex_exec_command(
+        mode="resume",
+        resume_session_id=str(session_id),
+        proj_dir=proj_dir,
+        profile=profile,
+        schema_path=schema_path,
+        last_file=last_file,
+        ephemeral=args.ephemeral,
+        full_auto=args.full_auto,
+        sandbox=args.sandbox,
+        ask_for_approval=args.ask_for_approval,
+        model=args.model,
+        json_events=args.json_events,
+        skip_git_repo_check=args.skip_git_repo_check,
+    )
+
+    _start_common(
+        args=args,
+        run_id=run_id,
+        run_dir=run_dir,
+        proj_name=str(proj_name),
+        proj_dir=proj_dir,
+        profile=profile,
+        codex_cmd=codex_cmd,
+        title=args.title,
+        parent_run_id=parent_run_id,
+        resume_session_id=str(session_id),
+    )
+
+    notify_target = cfg.get("tmux_notify_target", f"{tmux_session}:0")
+    _tmux_display_message(notify_target, f"↩️ Codex resumed: {run_id} (parent={parent_run_id})")
+    print(run_id)
+    return 0
+
+
+def _extract_thread_id(events_path: Path) -> Optional[str]:
+    if not events_path.exists():
+        return None
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "thread.started":
+                    tid = obj.get("thread_id") or obj.get("thread-id") or obj.get("threadId")
+                    if isinstance(tid, str) and tid:
+                        return tid
+                if obj.get("type") == "thread.started" and isinstance(obj.get("thread"), dict):
+                    tid = obj["thread"].get("id")
+                    if isinstance(tid, str) and tid:
+                        return tid
+    except Exception:
+        return None
+    return None
+
+
+def _read_last_message(last_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not last_path.exists():
+        return None, None
+    raw = last_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None, None
+    try:
+        return json.loads(raw), raw
+    except json.JSONDecodeError:
+        return None, raw
+
+
+def _git_diff_stat(repo: Path) -> Optional[str]:
+    try:
+        out = subprocess.check_output(["git", "-C", str(repo), "diff", "--stat"], text=True, stderr=subprocess.DEVNULL).strip()
+        return out or ""
+    except Exception:
+        return None
+
+
+def cmd_on_finish(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    cfg = _load_json(p["config"], {})
+
+    run_id = args.run_id
+    run_dir = p["runs"] / run_id
+    meta_path = run_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"[agentctl] _on_finish: meta not found for run_id={run_id}", file=sys.stderr)
+        return 2
+
+    meta = _load_json(meta_path, {})
+    meta["status"] = "finished"
+    meta["exit_code"] = int(args.exit_code)
+    meta["ended_at"] = _now_iso()
+
+    if not meta.get("thread_id"):
+        thread_id = _extract_thread_id(run_dir / "events.jsonl")
+        if thread_id:
+            meta["thread_id"] = thread_id
+
+    parsed, raw = _read_last_message(run_dir / "last_message.json")
+    if parsed is not None:
+        meta["goal_met"] = parsed.get("goal_met")
+        meta["summary"] = parsed.get("summary")
+        meta["last_message"] = parsed
+    else:
+        meta["last_message_raw"] = raw
+
+    proj_dir = Path(meta.get("project_dir", "")).expanduser()
+    diff_stat = _git_diff_stat(proj_dir) if proj_dir else None
+    if diff_stat is not None:
+        meta["git_diff_stat"] = diff_stat
+
+    _save_json(meta_path, meta)
+
+    summary = meta.get("summary")
+    goal_met = meta.get("goal_met")
+    emoji = "✅" if goal_met is True and meta.get("exit_code") == 0 else ("⚠️" if meta.get("exit_code") == 0 else "❌")
+    line = f"[{_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {emoji} done {run_id} proj={meta.get('project')} profile={meta.get('profile')} goal_met={goal_met} exit={meta.get('exit_code')}"
+    if summary:
+        line += f" — {summary}"
+    line += "\n"
+
+    p["notify_log"].write_text(p["notify_log"].read_text(encoding="utf-8") + line, encoding="utf-8")
+
+    tmux_target = cfg.get("tmux_notify_target") or f"{cfg.get('tmux_session','ai')}:0"
+    _tmux_display_message(tmux_target, line.strip())
+
+    sendkeys_target = (cfg.get("tmux_sendkeys_target") or "").strip()
+    if sendkeys_target:
+        msg = f"[AI_ORCH DONE run_id={run_id} goal_met={goal_met} exit={meta.get('exit_code')}]"
+        _tmux_send_keys(sendkeys_target, msg, enter=True)
+
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    runs_dir = p["runs"]
+
+    runs = sorted([d for d in runs_dir.iterdir() if d.is_dir()], key=lambda d: d.name, reverse=True)
+    runs = runs[: args.limit]
+
+    for d in runs:
+        meta_path = d / "meta.json"
+        if not meta_path.exists():
+            continue
+        meta = _load_json(meta_path, {})
+        status = meta.get("status")
+        proj = meta.get("project")
+        profile = meta.get("profile")
+        goal = meta.get("goal_met")
+        ec = meta.get("exit_code")
+        title = meta.get("title") or ""
+        parent = meta.get("parent_run_id") or ""
+        print(f"{d.name}\t{status}\tproj={proj}\tprofile={profile}\tgoal_met={goal}\texit={ec}\tparent={parent}\t{title}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    run_dir = p["runs"] / args.run_id
+    meta_path = run_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"❌ unknown run_id: {args.run_id}", file=sys.stderr)
+        return 2
+    meta = _load_json(meta_path, {})
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_tail(args: argparse.Namespace) -> int:
+    home = _default_home()
+    p = _ensure_init(home)
+    log_path = p["notify_log"]
+    with log_path.open("r", encoding="utf-8") as f:
+        f.seek(0, os.SEEK_END)
+        try:
+            while True:
+                line = f.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    subprocess.run(["bash", "-lc", "sleep 0.2"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except KeyboardInterrupt:
+            return 0
+
+
+def _add_common_exec_flags(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--profile", default=None, help="Codex profile name (from ~/.codex/config.toml).")
+    sp.add_argument("--title", default="")
+    sp.add_argument("--prompt-file", default="-", help="Path to prompt file, or '-' for stdin.")
+    sp.add_argument("--run-id", default=None, help="Optional explicit run id.")
+    sp.add_argument("--tmux-session", default=None, help="tmux session to create the window in.")
+    sp.add_argument("--full-auto", action="store_true", default=True, help="Use --full-auto. Default: true.")
+    sp.add_argument("--no-full-auto", action="store_false", dest="full_auto")
+    sp.add_argument("--sandbox", default=None, help="Override sandbox: read-only | workspace-write | danger-full-access")
+    sp.add_argument("--ask-for-approval", default=None, help="Override approval: untrusted | on-failure | on-request | never")
+    sp.add_argument("--model", default=None, help="Override model slug, e.g. gpt-5.3-codex-spark")
+    sp.add_argument("--ephemeral", action="store_true", help="Use --ephemeral (no persistent session). Disables resume.")
+    sp.add_argument("--json-events", action="store_true", default=True, help="Capture JSONL events via --json. Default: true.")
+    sp.add_argument("--no-json-events", action="store_false", dest="json_events")
+    sp.add_argument("--output-schema", default=None, help="Path to JSON Schema file for the final response.")
+    sp.add_argument("--skip-git-repo-check", action="store_true", help="Allow running outside a Git repo (unsafe).")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="agentctl")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="Initialize ~/.ai-orch and seed config/schema/projects.")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("add-project", help="Register a project name -> path.")
+    sp.add_argument("name")
+    sp.add_argument("path")
+    sp.add_argument("--default-profile", default="spark")
+    sp.set_defaults(func=cmd_add_project)
+
+    sp = sub.add_parser("start", help="Start a Codex run in a new tmux window.")
+    sp.add_argument("--project", required=True)
+    _add_common_exec_flags(sp)
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("resume", help="Resume a previous non-interactive session (codex exec resume).")
+    sp.add_argument("--parent-run-id", required=True, help="Run id to resume (uses its stored thread_id).")
+    _add_common_exec_flags(sp)
+    sp.set_defaults(func=cmd_resume)
+
+    sp = sub.add_parser("_on_finish", help=argparse.SUPPRESS)
+    sp.add_argument("--run-id", required=True)
+    sp.add_argument("--exit-code", required=True)
+    sp.set_defaults(func=cmd_on_finish)
+
+    sp = sub.add_parser("list", help="List recent runs.")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("show", help="Show run metadata (JSON).")
+    sp.add_argument("run_id")
+    sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("tail", help="Tail orchestrator notifications (like tail -f).")
+    sp.set_defaults(func=cmd_tail)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
