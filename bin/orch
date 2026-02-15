@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Launch Claude Code as the orchestrator for the current directory.
+#
+# Usage:
+#   orch                    # orchestrate in cwd
+#   orch /path/to/repo      # orchestrate in a specific repo
+#   orch -c                 # continue last orchestrator session
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ORCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGENTCTL="$SCRIPT_DIR/agentctl"
+PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator.md"
+
+if [ ! -f "$PROMPT_FILE" ]; then
+    echo "Error: orchestrator prompt not found at $PROMPT_FILE" >&2
+    exit 1
+fi
+
+# Build the system prompt with context
+SYSTEM_PROMPT="$(cat "$PROMPT_FILE")
+
+---
+agentctl location: $AGENTCTL
+Prompt templates: $ORCH_ROOT/prompts/
+To run agentctl: python3 $AGENTCTL <command> [args...]"
+
+# Parse args
+TARGET_DIR=""
+EXTRA_ARGS=()
+
+for arg in "$@"; do
+    case "$arg" in
+        -c|--continue|-r|--resume)
+            EXTRA_ARGS+=("$arg")
+            ;;
+        -*)
+            EXTRA_ARGS+=("$arg")
+            ;;
+        *)
+            if [ -z "$TARGET_DIR" ] && [ -d "$arg" ]; then
+                TARGET_DIR="$arg"
+            else
+                EXTRA_ARGS+=("$arg")
+            fi
+            ;;
+    esac
+done
+
+# cd to target directory if specified
+if [ -n "$TARGET_DIR" ]; then
+    cd "$TARGET_DIR"
+fi
+
+if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+    exec claude --append-system-prompt "$SYSTEM_PROMPT"
+else
+    exec claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}"
+fi

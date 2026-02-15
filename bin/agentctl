@@ -12,6 +12,13 @@ No external deps. Python 3.9+ recommended.
 """
 from __future__ import annotations
 
+# Disable output buffering so pipes (| head, etc.) don't hang.
+import io as _io
+import sys as _sys_early
+if not _sys_early.stdout.isatty():
+    _sys_early.stdout = _io.TextIOWrapper(_sys_early.stdout.buffer, write_through=True)
+    _sys_early.stderr = _io.TextIOWrapper(_sys_early.stderr.buffer, write_through=True)
+
 import argparse
 import datetime as _dt
 import json
@@ -36,7 +43,11 @@ def _short_rand(n: int = 6) -> str:
 
 
 def _default_home() -> Path:
-    return Path(os.environ.get("AI_ORCH_HOME", "~/.ai-orch")).expanduser()
+    env = os.environ.get("AI_ORCH_HOME")
+    if env:
+        return Path(env).expanduser()
+    # Default: .ai-orch next to the project root (parent of bin/)
+    return Path(__file__).resolve().parent.parent / ".ai-orch"
 
 
 def _paths(home: Path) -> Dict[str, Path]:
@@ -184,12 +195,37 @@ def cmd_add_project(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_project(name: str, projects_path: Path) -> Dict[str, Any]:
+def _get_project(name: str, projects_path: Path) -> Optional[Dict[str, Any]]:
     data = _load_json(projects_path, {"projects": {}})
-    proj = data.get("projects", {}).get(name)
-    if not proj:
-        raise KeyError(f"Unknown project '{name}'. Add it via: agentctl add-project {name} /path/to/repo")
-    return proj
+    return data.get("projects", {}).get(name)
+
+
+def _resolve_project(args: argparse.Namespace, projects_path: Path) -> Tuple[str, Path, Optional[str]]:
+    """Resolve project name, directory, and default profile.
+
+    If --project is given and registered, use it.
+    If --project is given but not registered, treat it as a path.
+    If --project is not given, use cwd.
+
+    Returns (proj_name, proj_dir, default_profile).
+    """
+    project_arg = getattr(args, "project", None)
+
+    if project_arg:
+        # Try registered project first
+        proj = _get_project(project_arg, projects_path)
+        if proj:
+            return project_arg, Path(proj["path"]), proj.get("default_profile")
+        # Treat as path
+        proj_dir = Path(project_arg).expanduser().resolve()
+        if proj_dir.is_dir():
+            return proj_dir.name, proj_dir, None
+        print(f"Error: '{project_arg}' is not a registered project or valid directory.", file=sys.stderr)
+        sys.exit(2)
+
+    # Default: current working directory
+    proj_dir = Path.cwd().resolve()
+    return proj_dir.name, proj_dir, None
 
 
 def _write_run_meta(run_dir: Path, meta: Dict[str, Any]) -> None:
@@ -200,13 +236,14 @@ def _new_run_id() -> str:
     return f"{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_short_rand(4)}"
 
 
-def _build_codex_exec_command(
+def _build_codex_command(
     *,
     mode: str,
     proj_dir: Path,
     profile: str,
-    schema_path: Path,
-    last_file: Path,
+    prompt_file: Path,
+    schema_path: Optional[Path],
+    last_file: Optional[Path],
     ephemeral: bool,
     full_auto: bool,
     sandbox: Optional[str],
@@ -214,57 +251,106 @@ def _build_codex_exec_command(
     model: Optional[str],
     json_events: bool,
     skip_git_repo_check: bool,
+    headless: bool,
     resume_session_id: Optional[str] = None,
 ) -> str:
     """
     Returns a shell-ready string.
 
-    mode: "exec" or "resume"
+    headless=True  -> codex exec (no UI, for scripting)
+    headless=False -> codex (full TUI, user can watch)
     """
-    parts: list[str] = ["codex", "exec"]
-    if mode == "resume":
-        parts.append("resume")
-        if resume_session_id:
-            parts.append(shlex.quote(resume_session_id))
+    if headless:
+        parts: list[str] = ["codex", "exec"]
+        if mode == "resume":
+            parts.append("resume")
+            if resume_session_id:
+                parts.append(shlex.quote(resume_session_id))
+    else:
+        parts = ["codex"]
 
     parts += ["-C", shlex.quote(str(proj_dir)), "--profile", shlex.quote(profile)]
 
-    if ephemeral:
+    if headless and ephemeral:
         parts.append("--ephemeral")
-    if full_auto:
-        parts.append("--full-auto")
     if sandbox:
-        parts += ["--sandbox", shlex.quote(sandbox)]
+        if full_auto:
+            parts.append("--full-auto")
+        if headless:
+            parts += ["--sandbox", shlex.quote(sandbox)]
+        else:
+            parts += ["-c", f"sandbox_mode={shlex.quote(sandbox)}"]
+    elif headless:
+        # No sandbox specified: bypass sandbox entirely for full network access (SOCKS, etc.)
+        # --dangerously-bypass-approvals-and-sandbox already implies --full-auto
+        parts.append("--dangerously-bypass-approvals-and-sandbox")
+    elif full_auto:
+        parts.append("--full-auto")
     if ask_for_approval:
-        parts += ["--ask-for-approval", shlex.quote(ask_for_approval)]
+        if headless:
+            parts += ["--ask-for-approval", shlex.quote(ask_for_approval)]
+        else:
+            parts += ["-c", f"approval_policy={shlex.quote(ask_for_approval)}"]
     if model:
         parts += ["--model", shlex.quote(model)]
-    if json_events:
+    if headless and json_events:
         parts.append("--json")
-    if skip_git_repo_check:
+    if headless and skip_git_repo_check:
         parts.append("--skip-git-repo-check")
 
-    parts += ["--output-schema", shlex.quote(str(schema_path)), "-o", shlex.quote(str(last_file))]
+    if headless:
+        # exec mode: structured output + stdin prompt
+        if schema_path:
+            parts += ["--output-schema", shlex.quote(str(schema_path))]
+        if last_file:
+            parts += ["-o", shlex.quote(str(last_file))]
+        parts.append("-")  # read prompt from stdin
+    else:
+        # interactive mode: prompt as positional argument
+        prompt_text = prompt_file.read_text(encoding="utf-8").strip()
+        parts.append(shlex.quote(prompt_text))
 
-    # PROMPT: read from stdin
-    parts.append("-")
     return " ".join(parts)
 
 
-def _spawn_tmux_window(
+def _run_redirects(*, headless: bool, json_events: bool, events_file: Path, stderr_file: Path, prompt_file: Path) -> str:
+    """Shell redirections for the codex command."""
+    if headless:
+        if json_events:
+            return f'< "{prompt_file}" > "{events_file}" 2> "{stderr_file}"'
+        return f'< "{prompt_file}" 2> "{stderr_file}"'
+    # Interactive mode: no stdin redirect (prompt is a positional arg), stderr to log
+    return f'2> "{stderr_file}"'
+
+
+def _spawn_tmux_pane(
     *,
-    tmux_session: str,
-    window_name: str,
+    tmux_target: str,
     cwd: Path,
     script_path: Path,
+    main_pane_width: str = "50%",
 ) -> None:
+    """Spawn a new pane on the right side of the orchestrator window.
+
+    Uses main-vertical layout: pane 0 (orchestrator) stays on the left,
+    all agent panes stack vertically on the right.
+    """
     if not _have_tmux():
         raise RuntimeError("tmux not found")
+    # Split horizontally from the target window — new pane appears on the right
     subprocess.run(
-        ["tmux", "new-window", "-t", tmux_session, "-n", window_name, "-c", str(cwd), "bash", str(script_path)],
+        ["tmux", "split-window", "-h", "-t", tmux_target,
+         "-c", str(cwd), "bash", str(script_path)],
         check=True,
     )
-    subprocess.run(["tmux", "set-option", "-t", f"{tmux_session}:{window_name}", "remain-on-exit", "on"], check=False)
+    # Keep finished panes open for inspection
+    subprocess.run(["tmux", "set-option", "-t", tmux_target, "remain-on-exit", "on"], check=False)
+    # Set main pane width (orchestrator)
+    subprocess.run(["tmux", "set-option", "-t", tmux_target, "main-pane-width", main_pane_width], check=False)
+    # Rebalance: main-vertical = pane 0 left, rest stacked right
+    subprocess.run(["tmux", "select-layout", "-t", tmux_target, "main-vertical"], check=False)
+    # Return focus to the orchestrator pane (pane 0)
+    subprocess.run(["tmux", "select-pane", "-t", f"{tmux_target}.0"], check=False)
 
 
 def _start_common(
@@ -280,8 +366,10 @@ def _start_common(
     parent_run_id: Optional[str] = None,
     resume_session_id: Optional[str] = None,
 ) -> None:
-    prompt = _read_prompt(args.prompt_file)
-    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+    prompt_path = run_dir / "prompt.md"
+    if not prompt_path.exists():
+        prompt = _read_prompt(args.prompt_file)
+        prompt_path.write_text(prompt, encoding="utf-8")
 
     meta = {
         "run_id": run_id,
@@ -318,9 +406,25 @@ def _start_common(
                 'echo "[agentctl] run=$RUN_ID project=$PROJECT_DIR profile=' + profile + '"',
                 "cd \"$PROJECT_DIR\"",
                 "",
+                "# Watchdog: auto-kill Codex after result.json appears",
+                'RESULT_FILE="$RUN_DIR/result.json"',
+                'SCRIPT_PID=$$',
+                '(',
+                '  while true; do',
+                '    sleep 5',
+                '    if [ -f "$RESULT_FILE" ]; then',
+                '      sleep 3  # grace period',
+                '      pkill -P "$SCRIPT_PID" -f codex 2>/dev/null || true',
+                '      break',
+                '    fi',
+                '  done',
+                ') &',
+                'WATCHDOG_PID=$!',
+                "",
                 "set +e",
-                f'{codex_cmd} < "{str(prompt_file)}" > "{str(events_file)}" 2> >(tee "{str(stderr_file)}" >&2)',
+                f'{codex_cmd} {_run_redirects(headless=args.headless, json_events=args.json_events, events_file=events_file, stderr_file=stderr_file, prompt_file=prompt_file)}',
                 "EC=$?",
+                'kill $WATCHDOG_PID 2>/dev/null; wait $WATCHDOG_PID 2>/dev/null',
                 "set -e",
                 "",
                 f'python3 "{str(Path(__file__).resolve())}" _on_finish --run-id "$RUN_ID" --exit-code "$EC"',
@@ -328,8 +432,8 @@ def _start_common(
                 'echo ""',
                 'echo "[agentctl] done run=$RUN_ID exit=$EC"',
                 f'echo "[agentctl] artifacts: {str(run_dir)}"',
-                'echo "Drop into a shell for inspection. Type exit to close this tmux window."',
-                'exec "${SHELL:-/bin/bash}" -l',
+                '# Auto-close pane when done',
+                'tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || exit 0',
                 "",
             ]
         )
@@ -339,18 +443,18 @@ def _start_common(
     run_sh.chmod(0o755)
 
     tmux_session = args.tmux_session
-    window_name = _safe_tmux_name(f"{proj_name}-{profile}-{run_id[-6:]}", max_len=35)
-    _spawn_tmux_window(tmux_session=tmux_session, window_name=window_name, cwd=proj_dir, script_path=run_sh)
+    # Target the orchestrator's window (default: window where orchestrator runs)
+    tmux_target = f"{tmux_session}:{args.tmux_window}" if getattr(args, "tmux_window", None) else tmux_session
+    _spawn_tmux_pane(tmux_target=tmux_target, cwd=proj_dir, script_path=run_sh)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
     home = _default_home()
     p = _ensure_init(home)
     cfg = _load_json(p["config"], {})
-    proj = _get_project(args.project, p["projects"])
-    proj_dir = Path(proj["path"])
+    proj_name, proj_dir, default_profile = _resolve_project(args, p["projects"])
 
-    profile = args.profile or proj.get("default_profile") or "spark"
+    profile = args.profile or default_profile or "spark"
     run_id = args.run_id or _new_run_id()
     run_dir = p["runs"] / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -361,12 +465,32 @@ def cmd_start(args: argparse.Namespace) -> int:
     schema_path = Path(args.output_schema).expanduser() if args.output_schema else p["schema"]
     last_file = run_dir / "last_message.json"
 
-    codex_cmd = _build_codex_exec_command(
+    prompt_file_path = run_dir / "prompt.md"
+    result_file = run_dir / "result.json"
+    # Write prompt early so _build_codex_command can read it in non-headless mode
+    prompt_text_raw = _read_prompt(args.prompt_file)
+    if not args.headless:
+        # Inject result-file instruction so interactive Codex writes structured output
+        result_instruction = (
+            f"\n\n# RESULT FILE (mandatory)\n"
+            f"When you are completely done, you MUST write your final result as a JSON file:\n"
+            f"Path: {result_file}\n"
+            f"Schema: {{\"goal_met\": bool, \"summary\": string, \"followup_prompt\": string, \"notes\": string}}\n"
+            f"Use a shell command like: cat > {result_file} << 'RESULT_EOF'\n"
+            f"{{...your JSON...}}\n"
+            f"RESULT_EOF\n"
+            f"This is your LAST action before finishing."
+        )
+        prompt_text_raw = prompt_text_raw.rstrip() + result_instruction
+    prompt_file_path.write_text(prompt_text_raw, encoding="utf-8")
+
+    codex_cmd = _build_codex_command(
         mode="exec",
         proj_dir=proj_dir,
         profile=profile,
-        schema_path=schema_path,
-        last_file=last_file,
+        prompt_file=prompt_file_path,
+        schema_path=schema_path if args.headless else None,
+        last_file=last_file if args.headless else None,
         ephemeral=args.ephemeral,
         full_auto=args.full_auto,
         sandbox=args.sandbox,
@@ -374,13 +498,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         model=args.model,
         json_events=args.json_events,
         skip_git_repo_check=args.skip_git_repo_check,
+        headless=args.headless,
     )
 
     _start_common(
         args=args,
         run_id=run_id,
         run_dir=run_dir,
-        proj_name=args.project,
+        proj_name=proj_name,
         proj_dir=proj_dir,
         profile=profile,
         codex_cmd=codex_cmd,
@@ -388,7 +513,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
 
     notify_target = cfg.get("tmux_notify_target", f"{tmux_session}:0")
-    _tmux_display_message(notify_target, f"▶️ Codex started: {run_id} ({args.project}, {profile})")
+    _tmux_display_message(notify_target, f"▶️ Codex started: {run_id} ({proj_name}, {profile})")
     print(run_id)
     return 0
 
@@ -427,13 +552,32 @@ def cmd_resume(args: argparse.Namespace) -> int:
     schema_path = Path(args.output_schema).expanduser() if args.output_schema else p["schema"]
     last_file = run_dir / "last_message.json"
 
-    codex_cmd = _build_codex_exec_command(
+    prompt_file_path = run_dir / "prompt.md"
+    result_file = run_dir / "result.json"
+    # Write prompt early so _build_codex_command can read it in non-headless mode
+    prompt_text_raw = _read_prompt(args.prompt_file)
+    if not args.headless:
+        result_instruction = (
+            f"\n\n# RESULT FILE (mandatory)\n"
+            f"When you are completely done, you MUST write your final result as a JSON file:\n"
+            f"Path: {result_file}\n"
+            f"Schema: {{\"goal_met\": bool, \"summary\": string, \"followup_prompt\": string, \"notes\": string}}\n"
+            f"Use a shell command like: cat > {result_file} << 'RESULT_EOF'\n"
+            f"{{...your JSON...}}\n"
+            f"RESULT_EOF\n"
+            f"This is your LAST action before finishing."
+        )
+        prompt_text_raw = prompt_text_raw.rstrip() + result_instruction
+    prompt_file_path.write_text(prompt_text_raw, encoding="utf-8")
+
+    codex_cmd = _build_codex_command(
         mode="resume",
         resume_session_id=str(session_id),
         proj_dir=proj_dir,
         profile=profile,
-        schema_path=schema_path,
-        last_file=last_file,
+        prompt_file=prompt_file_path,
+        schema_path=schema_path if args.headless else None,
+        last_file=last_file if args.headless else None,
         ephemeral=args.ephemeral,
         full_auto=args.full_auto,
         sandbox=args.sandbox,
@@ -441,6 +585,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         model=args.model,
         json_events=args.json_events,
         skip_git_repo_check=args.skip_git_repo_check,
+        headless=args.headless,
     )
 
     _start_common(
@@ -531,6 +676,9 @@ def cmd_on_finish(args: argparse.Namespace) -> int:
             meta["thread_id"] = thread_id
 
     parsed, raw = _read_last_message(run_dir / "last_message.json")
+    if parsed is None:
+        # Fallback: interactive mode writes result.json via prompt instruction
+        parsed, raw = _read_last_message(run_dir / "result.json")
     if parsed is not None:
         meta["goal_met"] = parsed.get("goal_met")
         meta["summary"] = parsed.get("summary")
@@ -586,7 +734,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         ec = meta.get("exit_code")
         title = meta.get("title") or ""
         parent = meta.get("parent_run_id") or ""
-        print(f"{d.name}\t{status}\tproj={proj}\tprofile={profile}\tgoal_met={goal}\texit={ec}\tparent={parent}\t{title}")
+        print(f"{d.name}\t{status}\tproj={proj}\tprofile={profile}\tgoal_met={goal}\texit={ec}\tparent={parent}\t{title}", flush=True)
     return 0
 
 
@@ -601,6 +749,42 @@ def cmd_show(args: argparse.Namespace) -> int:
     meta = _load_json(meta_path, {})
     print(json.dumps(meta, ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until run finishes, then print result JSON. Designed to be run in background."""
+    import time
+
+    home = _default_home()
+    p = _ensure_init(home)
+    run_id = args.run_id
+    run_dir = p["runs"] / run_id
+    meta_path = run_dir / "meta.json"
+    result_path = run_dir / "result.json"
+    interval = args.interval
+    timeout = args.timeout
+
+    if not meta_path.exists():
+        print(f'{{"error": "unknown run_id: {run_id}"}}')
+        return 2
+
+    start_time = time.monotonic()
+    while True:
+        # Check result.json (interactive mode)
+        if result_path.exists():
+            time.sleep(2)  # let _on_finish update meta
+
+        meta = _load_json(meta_path, {})
+        if meta.get("status") == "finished":
+            print(json.dumps(meta, ensure_ascii=False, indent=2))
+            return 0
+
+        if timeout > 0 and (time.monotonic() - start_time) > timeout:
+            meta["_wait_timeout"] = True
+            print(json.dumps(meta, ensure_ascii=False, indent=2))
+            return 1
+
+        time.sleep(interval)
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
@@ -629,14 +813,17 @@ def _add_common_exec_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--tmux-session", default=None, help="tmux session to create the window in.")
     sp.add_argument("--full-auto", action="store_true", default=True, help="Use --full-auto. Default: true.")
     sp.add_argument("--no-full-auto", action="store_false", dest="full_auto")
-    sp.add_argument("--sandbox", default=None, help="Override sandbox: read-only | workspace-write | danger-full-access")
-    sp.add_argument("--ask-for-approval", default=None, help="Override approval: untrusted | on-failure | on-request | never")
+    sp.add_argument("--sandbox", default=None, help="Override sandbox: read-only | workspace-write | danger-full-access. Default: none (no sandbox).")
+    sp.add_argument("--ask-for-approval", default=None, help="Override approval: untrusted | on-failure | on-request | never. Default: none (use --full-auto instead).")
     sp.add_argument("--model", default=None, help="Override model slug, e.g. gpt-5.3-codex-spark")
-    sp.add_argument("--ephemeral", action="store_true", help="Use --ephemeral (no persistent session). Disables resume.")
-    sp.add_argument("--json-events", action="store_true", default=True, help="Capture JSONL events via --json. Default: true.")
+    sp.add_argument("--ephemeral", action="store_true", default=True, help="Use --ephemeral (no persistent session). Default: true.")
+    sp.add_argument("--no-ephemeral", action="store_false", dest="ephemeral", help="Disable ephemeral mode (enables resume).")
+    sp.add_argument("--json-events", action="store_true", default=False, help="Capture JSONL events via --json (hides terminal output).")
     sp.add_argument("--no-json-events", action="store_false", dest="json_events")
     sp.add_argument("--output-schema", default=None, help="Path to JSON Schema file for the final response.")
     sp.add_argument("--skip-git-repo-check", action="store_true", help="Allow running outside a Git repo (unsafe).")
+    sp.add_argument("--headless", action="store_true", default=False, help="Use codex exec (no UI). NOT recommended — agents run with full TUI by default.")
+    sp.add_argument("--watch", action="store_false", dest="headless", help="Use interactive codex with full TUI (default).")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -653,7 +840,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_add_project)
 
     sp = sub.add_parser("start", help="Start a Codex run in a new tmux window.")
-    sp.add_argument("--project", required=True)
+    sp.add_argument("--project", default=None, help="Project name (registered) or path. Default: cwd.")
     _add_common_exec_flags(sp)
     sp.set_defaults(func=cmd_start)
 
@@ -674,6 +861,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("show", help="Show run metadata (JSON).")
     sp.add_argument("run_id")
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("wait", help="Block until a run finishes, then print result JSON. Use with run_in_background.")
+    sp.add_argument("run_id", help="Run id to wait for.")
+    sp.add_argument("--interval", type=float, default=5, help="Poll interval in seconds. Default: 5.")
+    sp.add_argument("--timeout", type=float, default=0, help="Max wait time in seconds. 0 = no limit. Default: 0.")
+    sp.set_defaults(func=cmd_wait)
 
     sp = sub.add_parser("tail", help="Tail orchestrator notifications (like tail -f).")
     sp.set_defaults(func=cmd_tail)

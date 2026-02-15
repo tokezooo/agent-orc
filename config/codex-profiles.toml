@@ -1,19 +1,9 @@
-# ~/.codex/config.toml
-# Template for Codex CLI configuration with orchestrator profiles.
-# Copy to ~/.codex/config.toml and adjust as needed.
-# Project-level overrides go in <repo>/.codex/config.toml (after trust).
-
-# Defaults (for interactive sessions)
-approval_policy = "never"          # untrusted | on-failure | on-request | never
-sandbox_mode = "danger-full-access" # read-only | workspace-write | danger-full-access
-
 # Profile: fast edits / small tasks
 [profiles.spark]
 model = "gpt-5.3-codex-spark"
 model_reasoning_effort = "low"
 model_verbosity = "low"
 approval_policy = "never"
-sandbox_mode = "danger-full-access"
 
 # Profile: deep analysis / planning (xhigh reasoning)
 [profiles.deep]
@@ -22,7 +12,6 @@ model_reasoning_effort = "xhigh"   # model-dependent
 model_verbosity = "medium"
 model_reasoning_summary = "detailed"
 approval_policy = "never"
-sandbox_mode = "danger-full-access"
 
 # Profile: review (read-only, no approval needed)
 [profiles.review]

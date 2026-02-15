@@ -2,87 +2,63 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENTCTL_SRC="$SCRIPT_DIR/bin/agentctl"
-AGENTCTL_DST="$HOME/bin/agentctl"
+AGENTCTL="$SCRIPT_DIR/bin/agentctl"
 
-echo "=== agent-orc installer ==="
+echo "=== agent-orc setup ==="
 echo ""
 
-# 1. Ensure ~/bin exists
-mkdir -p "$HOME/bin"
+# 1. Initialize local workspace (.ai-orch/ inside project dir)
+echo "Initializing local agentctl workspace..."
+python3 "$AGENTCTL" init
+echo ""
 
-# 2. Copy agentctl
-if [ -f "$AGENTCTL_DST" ]; then
-    echo "Existing agentctl found at $AGENTCTL_DST"
-    echo "Backing up to ${AGENTCTL_DST}.bak"
-    cp "$AGENTCTL_DST" "${AGENTCTL_DST}.bak"
-fi
-cp "$AGENTCTL_SRC" "$AGENTCTL_DST"
-chmod +x "$AGENTCTL_DST"
-echo "Installed agentctl -> $AGENTCTL_DST"
+# 2. Install Codex profiles to ~/.codex/config.toml
+CODEX_CONFIG_DIR="$HOME/.codex"
+CODEX_CONFIG="$CODEX_CONFIG_DIR/config.toml"
+mkdir -p "$CODEX_CONFIG_DIR"
 
-# 3. Ensure ~/bin is in PATH
-SHELL_RC=""
-if [ -f "$HOME/.zshrc" ]; then
-    SHELL_RC="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-    SHELL_RC="$HOME/.bashrc"
-fi
-
-if [ -n "$SHELL_RC" ]; then
-    if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$SHELL_RC" 2>/dev/null; then
-        echo '' >> "$SHELL_RC"
-        echo '# agentctl (agent-orc)' >> "$SHELL_RC"
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$SHELL_RC"
-        echo "Added ~/bin to PATH in $SHELL_RC"
+if [ -f "$CODEX_CONFIG" ]; then
+    # Check if our profiles already exist
+    if grep -q '\[profiles\.spark\]' "$CODEX_CONFIG" 2>/dev/null; then
+        echo "Codex profiles (spark/deep/review) already present in $CODEX_CONFIG"
     else
-        echo "~/bin already in PATH ($SHELL_RC)"
+        echo "Appending agentctl profiles (spark/deep/review) to $CODEX_CONFIG"
+        echo "" >> "$CODEX_CONFIG"
+        echo "# --- agentctl profiles (added by agent-orc installer) ---" >> "$CODEX_CONFIG"
+        cat "$SCRIPT_DIR/config/codex-profiles.toml" >> "$CODEX_CONFIG"
     fi
 else
-    echo "WARNING: Could not find .zshrc or .bashrc. Add ~/bin to PATH manually."
-fi
-
-# 4. Initialize agentctl workspace
-echo ""
-echo "Initializing agentctl workspace..."
-export PATH="$HOME/bin:$PATH"
-agentctl init
-
-# 5. Copy config templates (with confirmation)
-echo ""
-CODEX_CONFIG_DIR="$HOME/.codex"
-if [ ! -d "$CODEX_CONFIG_DIR" ]; then
-    mkdir -p "$CODEX_CONFIG_DIR"
-fi
-
-CODEX_CONFIG="$CODEX_CONFIG_DIR/config.toml"
-if [ -f "$CODEX_CONFIG" ]; then
-    echo "Existing Codex config found at $CODEX_CONFIG (not overwriting)"
-    echo "Template available at: $SCRIPT_DIR/config/codex-config.toml"
-else
+    echo "Creating Codex config with agentctl profiles at $CODEX_CONFIG"
     cp "$SCRIPT_DIR/config/codex-config.toml" "$CODEX_CONFIG"
-    echo "Installed Codex config -> $CODEX_CONFIG"
 fi
 
-CODEX_AGENTS="$CODEX_CONFIG_DIR/AGENTS.md"
-if [ -f "$CODEX_AGENTS" ]; then
-    echo "Existing global AGENTS.md found at $CODEX_AGENTS (not overwriting)"
-    echo "Template available at: $SCRIPT_DIR/config/agents-global.md"
-else
-    cp "$SCRIPT_DIR/config/agents-global.md" "$CODEX_AGENTS"
-    echo "Installed global AGENTS.md -> $CODEX_AGENTS"
-fi
+# NOTE: We do NOT touch ~/.codex/AGENTS.md (global).
+# Codex chains global + project-level AGENTS.md automatically.
+# Put project-specific rules in <repo>/AGENTS.md for each project.
 
-# 6. Done
+# 3. Done
 echo ""
-echo "=== Installation complete ==="
+echo "=== Setup complete ==="
 echo ""
-echo "Next steps:"
-echo "  1) source $SHELL_RC  (or open a new terminal)"
-echo "  2) agentctl add-project <name> /path/to/repo [--default-profile spark]"
+echo "agentctl data: $SCRIPT_DIR/.ai-orch/"
+echo "Codex profiles: $CODEX_CONFIG"
+echo ""
+echo "To use agentctl from anywhere, add an alias:"
+echo "  alias agentctl='python3 $AGENTCTL'"
+echo ""
+echo "--- AGENTS.md ---"
+echo "Codex reads AGENTS.md from two places (both are combined):"
+echo "  Global:  ~/.codex/AGENTS.md   (your personal rules, we don't touch this)"
+echo "  Project: <repo>/AGENTS.md     (per-project rules)"
+echo "Template for project-level AGENTS.md: $SCRIPT_DIR/config/agents-project.md"
+echo ""
+echo "--- Next steps ---"
+echo "  1) agentctl add-project <name> /path/to/repo [--default-profile spark]"
+echo "  2) Copy project AGENTS.md to your repos:"
+echo "     cp $SCRIPT_DIR/config/agents-project.md /path/to/repo/AGENTS.md"
 echo "  3) Ensure tmux is installed: brew install tmux"
 echo "  4) Start a tmux session: tmux new -s ai"
 echo "  5) Run tasks:"
-echo '     agentctl start --project <name> --profile spark <<"PROMPT"'
+echo '     agentctl start --project <name> --profile spark <<'"'"'PROMPT'"'"
 echo "     Your task prompt here..."
 echo "     PROMPT"
