@@ -1,5 +1,5 @@
 # TASK
-<что сделать>
+<what to do>
 
 # Expectations
 - First: identify the root cause / architecture impact.
@@ -7,7 +7,7 @@
 - Prefer incremental commits/checkpoints (if you choose to create them, mention it).
 
 # Acceptance
-- <tests/lint + функциональное условие>
+- <tests/lint + functional condition>
 
 # Output (STRICT)
 Return ONLY JSON with keys:

@@ -5,11 +5,13 @@
 #   orch                    # orchestrate in cwd
 #   orch /path/to/repo      # orchestrate in a specific repo
 #   orch -c                 # continue last orchestrator session
+#   orch --bridge           # auto-start codex-bridge in a tmux pane
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ORCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENTCTL="$SCRIPT_DIR/agentctl"
+BRIDGE="$SCRIPT_DIR/codex-bridge"
 PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator.md"
 
 if [ ! -f "$PROMPT_FILE" ]; then
@@ -27,10 +29,14 @@ To run agentctl: python3 $AGENTCTL <command> [args...]"
 
 # Parse args
 TARGET_DIR=""
+BRIDGE_MODE=false
 EXTRA_ARGS=()
 
 for arg in "$@"; do
     case "$arg" in
+        --bridge)
+            BRIDGE_MODE=true
+            ;;
         -c|--continue|-r|--resume)
             EXTRA_ARGS+=("$arg")
             ;;
@@ -50,6 +56,56 @@ done
 # cd to target directory if specified
 if [ -n "$TARGET_DIR" ]; then
     cd "$TARGET_DIR"
+fi
+
+if [ "$BRIDGE_MODE" = true ]; then
+    # Generate a unique team name
+    TEAM="orch-$(head -c 4 /dev/urandom | xxd -p | head -c 4)"
+
+    # Verify we're inside tmux
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: --bridge requires running inside a tmux session" >&2
+        echo "Start one with: tmux new -s ai" >&2
+        exit 1
+    fi
+
+    # Capture the current tmux session so the bridge spawns Codex panes here
+    TMUX_SESSION="$(tmux display-message -p '#S')"
+
+    # Spawn codex-bridge in a right-side tmux pane (waits for team to appear)
+    tmux split-window -h -d \
+        "python3 '$BRIDGE' join --team '$TEAM' --name codex-worker --project '$(pwd)' --tmux-session '$TMUX_SESSION'"
+
+    # Append bridge instructions to the system prompt
+    SYSTEM_PROMPT="$SYSTEM_PROMPT
+
+## Active Codex Bridge (OVERRIDES agentctl workflow)
+IMPORTANT: A codex-bridge daemon is running in the adjacent tmux pane.
+
+Step 1 — At the very start of this session, create the team:
+  TeamCreate(team_name=\"$TEAM\")
+The bridge worker 'codex-worker' will auto-join once the team exists.
+
+Step 2 — Assign ALL Codex work via TaskCreate:
+  TaskCreate(subject=\"...\", description=\"...\", owner=\"codex-worker\")
+Results arrive in your inbox automatically.
+
+DO NOT use 'agentctl start' or 'agentctl wait' directly — the bridge handles execution.
+Use agentctl only for 'agentctl show <run_id>' to inspect past results if needed."
+
+    # Run claude (not exec) so we can cleanup after it exits.
+    # Pass an initial prompt so Claude creates the team immediately.
+    INIT_PROMPT="Initialize: create team $TEAM and wait for my instructions."
+    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+        claude --append-system-prompt "$SYSTEM_PROMPT" "$INIT_PROMPT"
+    else
+        claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}" "$INIT_PROMPT"
+    fi
+
+    # Cleanup: tell bridge to leave
+    echo "Shutting down codex-bridge (team=$TEAM)..."
+    python3 "$BRIDGE" leave --team "$TEAM" --name codex-worker 2>/dev/null || true
+    exit 0
 fi
 
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then

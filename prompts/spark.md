@@ -1,9 +1,9 @@
 # TASK
-<одно предложение: что сделать>
+<one sentence: what to do>
 
 # Context
 - Repo: current directory
-- Goal: <что считается "готово">
+- Goal: <what counts as "done">
 
 # Constraints
 - Minimal diff.
@@ -11,7 +11,7 @@
 - Run only fast checks.
 
 # Acceptance
-- <1-3 пункта>
+- <1-3 items>
 
 # If blocked
 If anything is ambiguous or needs deeper analysis, set goal_met=false and write followup_prompt for a deep session.

@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""
+codex-bridge: Codex CLI as a Claude Code team member.
+
+Registers as a member in a Claude Code agent team (file-based protocol)
+and translates assigned tasks into Codex CLI runs via agentctl.
+
+Usage:
+    codex-bridge join  --team <name> --name codex-worker --project <proj> [options]
+    codex-bridge leave --team <name> --name codex-worker
+
+No external dependencies. Python 3.9+.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CLAUDE_HOME = Path.home() / ".claude"
+TEAMS_DIR = CLAUDE_HOME / "teams"
+TASKS_DIR = CLAUDE_HOME / "tasks"
+
+AGENTCTL = Path(__file__).resolve().parent / "agentctl"
+
+DEFAULT_POLL_INTERVAL = 3.0
+DEFAULT_TASK_TIMEOUT = 600
+DEFAULT_PROFILE = "spark"
+
+DEEP_KEYWORDS = frozenset({
+    "refactor", "plan", "complex", "architect", "redesign",
+    "migration", "rewrite", "multi-file", "multifile",
+})
+
+
+# ---------------------------------------------------------------------------
+# File locking (fcntl.flock)
+# ---------------------------------------------------------------------------
+
+class FileLock:
+    """Exclusive lock via fcntl.flock on a companion .lock file."""
+
+    def __init__(self, path: Path):
+        self.lock_path = path.parent / (path.name + ".lock")
+        self._fd: int | None = None
+
+    def __enter__(self) -> "FileLock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
+# ---------------------------------------------------------------------------
+# Atomic JSON helpers
+# ---------------------------------------------------------------------------
+
+def _read_json(path: Path, default: Any = None) -> Any:
+    """Read JSON from *path*; return *default* on missing/corrupt file."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """Write *data* as JSON via tmp-file + rename for atomicity."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.rename(tmp_path, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _now_ms() -> int:
+    """Current UTC timestamp in milliseconds (for joinedAt)."""
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp with millisecond precision."""
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _team_dir(team: str) -> Path:
+    return TEAMS_DIR / team
+
+
+def _config_path(team: str) -> Path:
+    return _team_dir(team) / "config.json"
+
+
+def _inbox_path(team: str, name: str) -> Path:
+    return _team_dir(team) / "inboxes" / f"{name}.json"
+
+
+def _tasks_dir(team: str) -> Path:
+    return TASKS_DIR / team
+
+
+# ---------------------------------------------------------------------------
+# Team registration
+# ---------------------------------------------------------------------------
+
+def register(team: str, name: str, project_dir: str) -> None:
+    """Add (or update) this worker in the team config.json and create inbox."""
+    cfg_path = _config_path(team)
+    with FileLock(cfg_path):
+        config = _read_json(cfg_path, {})
+        members: list = config.setdefault("members", [])
+        # Remove stale entry with same name
+        config["members"] = [m for m in members if m.get("name") != name]
+        config["members"].append({
+            "agentId": f"{name}@{team}",
+            "name": name,
+            "agentType": "codex-bridge",
+            "model": "codex-cli",
+            "color": "green",
+            "joinedAt": _now_ms(),
+            "tmuxPaneId": "",
+            "cwd": project_dir,
+            "subscriptions": [],
+            "backendType": "codex-bridge",
+            "isActive": True,
+            "mode": "default",
+        })
+        _write_json_atomic(cfg_path, config)
+
+    # Ensure inbox file exists
+    ib = _inbox_path(team, name)
+    if not ib.exists():
+        _write_json_atomic(ib, [])
+
+
+def deregister(team: str, name: str) -> None:
+    """Set isActive=false for this worker in the team config.json."""
+    cfg_path = _config_path(team)
+    with FileLock(cfg_path):
+        config = _read_json(cfg_path, {})
+        for m in config.get("members", []):
+            if m.get("name") == name:
+                m["isActive"] = False
+        _write_json_atomic(cfg_path, config)
+
+
+def _find_leader(team: str, my_name: str) -> Optional[str]:
+    """Return the name of the first active team member that isn't us."""
+    config = _read_json(_config_path(team), {})
+    for m in config.get("members", []):
+        if m.get("name") != my_name and m.get("isActive", True):
+            return m["name"]
+    # Fallback: any member that isn't us
+    for m in config.get("members", []):
+        if m.get("name") != my_name:
+            return m["name"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Inbox I/O
+# ---------------------------------------------------------------------------
+
+def _drain_inbox(team: str, name: str) -> List[Dict[str, Any]]:
+    """Atomically read and clear the inbox, returning all messages."""
+    ib = _inbox_path(team, name)
+    with FileLock(ib):
+        messages = _read_json(ib, [])
+        if messages:
+            _write_json_atomic(ib, [])
+    return messages if isinstance(messages, list) else []
+
+
+def _post_to_inbox(team: str, recipient: str, message: Dict[str, Any]) -> None:
+    """Append a message to *recipient*'s inbox."""
+    ib = _inbox_path(team, recipient)
+    with FileLock(ib):
+        messages = _read_json(ib, [])
+        if not isinstance(messages, list):
+            messages = []
+        messages.append(message)
+        _write_json_atomic(ib, messages)
+
+
+# ---------------------------------------------------------------------------
+# Task scanning & updates
+# ---------------------------------------------------------------------------
+
+def _scan_pending_tasks(team: str, owner: str) -> List[Dict[str, Any]]:
+    """Return pending, unblocked tasks assigned to *owner*, sorted by id."""
+    tdir = _tasks_dir(team)
+    if not tdir.exists():
+        return []
+
+    result: list[Dict[str, Any]] = []
+    for fpath in sorted(tdir.glob("*.json")):
+        task = _read_json(fpath)
+        if not isinstance(task, dict):
+            continue
+        if task.get("owner") != owner:
+            continue
+        if task.get("status") != "pending":
+            continue
+
+        # Check blockers
+        blocked_by = task.get("blockedBy", [])
+        if blocked_by:
+            all_resolved = True
+            for bid in blocked_by:
+                blocker = _read_json(tdir / f"{bid}.json")
+                if blocker and blocker.get("status") != "completed":
+                    all_resolved = False
+                    break
+            if not all_resolved:
+                continue
+
+        result.append(task)
+
+    return result
+
+
+def _update_task(team: str, task_id: str, updates: Dict[str, Any]) -> None:
+    """Merge *updates* into the task file."""
+    task_path = _tasks_dir(team) / f"{task_id}.json"
+    with FileLock(task_path):
+        task = _read_json(task_path, {})
+        task.update(updates)
+        _write_json_atomic(task_path, task)
+
+
+# ---------------------------------------------------------------------------
+# Profile selection heuristic
+# ---------------------------------------------------------------------------
+
+def _select_profile(subject: str, description: str, default: str) -> str:
+    """Return 'deep' if the task text contains complexity keywords, else *default*."""
+    text = f"{subject} {description}".lower()
+    for kw in DEEP_KEYWORDS:
+        if kw in text:
+            return "deep"
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+def _build_prompt(subject: str, description: str, inbox_context: str = "") -> str:
+    parts = [f"# TASK: {subject}"]
+    if description:
+        parts.append(f"\n{description}")
+    if inbox_context:
+        parts.append(f"\n## Additional Context\n{inbox_context}")
+    parts.append(
+        "\n# Output (STRICT)\n"
+        "Return ONLY JSON: {goal_met: bool, summary: string, "
+        "followup_prompt: string, notes: string}"
+    )
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Codex execution via agentctl
+# ---------------------------------------------------------------------------
+
+def _run_codex_task(
+    project: str,
+    profile: str,
+    prompt: str,
+    timeout: int,
+    tmux_session: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Start a Codex run via ``agentctl start`` and block on ``agentctl wait``."""
+
+    # --- agentctl start ---
+    try:
+        cmd = [
+            sys.executable, str(AGENTCTL),
+            "start", "--project", project, "--profile", profile,
+            "--prompt-file", "-",
+        ]
+        if tmux_session:
+            cmd.extend(["--tmux-session", tmux_session])
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return {
+                "goal_met": False,
+                "summary": f"agentctl start failed (rc={proc.returncode}): "
+                           f"{proc.stderr.strip()[:300]}",
+            }
+        run_id = proc.stdout.strip()
+        if not run_id:
+            return {"goal_met": False, "summary": "agentctl start returned empty run_id"}
+    except subprocess.TimeoutExpired:
+        return {"goal_met": False, "summary": "agentctl start timed out (30s)"}
+    except Exception as exc:
+        return {"goal_met": False, "summary": f"agentctl start error: {exc}"}
+
+    # --- agentctl wait ---
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(AGENTCTL),
+                "wait", run_id, "--timeout", str(timeout),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 60,
+        )
+        stdout = proc.stdout.strip()
+        if proc.returncode != 0 and not stdout:
+            return {
+                "goal_met": False,
+                "summary": f"agentctl wait failed: {proc.stderr.strip()[:300]}",
+                "run_id": run_id,
+            }
+        try:
+            meta = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {
+                "goal_met": False,
+                "summary": "agentctl wait returned invalid JSON",
+                "run_id": run_id,
+                "raw_output": stdout[:500],
+            }
+        return {
+            "goal_met": meta.get("goal_met", False),
+            "summary": meta.get("summary", "No summary"),
+            "run_id": run_id,
+            "exit_code": meta.get("exit_code"),
+            "git_diff_stat": meta.get("git_diff_stat", ""),
+            "profile": meta.get("profile"),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "goal_met": False,
+            "summary": f"agentctl wait timed out after {timeout}s",
+            "run_id": run_id,
+        }
+    except Exception as exc:
+        return {
+            "goal_met": False,
+            "summary": f"agentctl wait error: {exc}",
+            "run_id": run_id,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Result reporting
+# ---------------------------------------------------------------------------
+
+def _report_result(
+    team: str,
+    my_name: str,
+    task_id: str,
+    task_subject: str,
+    result: Dict[str, Any],
+) -> None:
+    """Update the task status and post a summary to the leader's inbox."""
+
+    goal_met = result.get("goal_met", False)
+    summary = result.get("summary", "No summary")
+    git_info = result.get("git_diff_stat", "")
+
+    # Update task status
+    if goal_met:
+        _update_task(team, task_id, {"status": "completed"})
+    # If failed, leave as in_progress so the leader can inspect / reassign.
+
+    # Build inbox message
+    tag = "COMPLETED" if goal_met else "FAILED"
+    text_lines = [f"[codex-bridge] Task #{task_id} {tag}"]
+    text_lines.append(f"Summary: {summary}")
+    if git_info:
+        text_lines.append(f"Git: {git_info}")
+    run_id = result.get("run_id")
+    if run_id:
+        text_lines.append(f"Run: {run_id}")
+
+    short_summary = summary[:60]
+    msg = {
+        "from": my_name,
+        "text": "\n".join(text_lines),
+        "summary": f"Task #{task_id} {'done' if goal_met else 'failed'}: {short_summary}",
+        "timestamp": _now_iso(),
+        "read": False,
+        "color": "green",
+    }
+
+    leader = _find_leader(team, my_name)
+    if leader:
+        _post_to_inbox(team, leader, msg)
+    else:
+        _log("No leader found; result not sent to inbox")
+
+
+# ---------------------------------------------------------------------------
+# Shutdown detection
+# ---------------------------------------------------------------------------
+
+def _is_shutdown_request(msg: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Check if an inbox message is a shutdown request.
+
+    Returns (is_shutdown, request_id).
+    """
+    text = msg.get("text", "")
+
+    # Try JSON-encoded protocol message
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("type") == "shutdown_request":
+            return True, parsed.get("requestId") or parsed.get("request_id")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Heuristic: plain-text shutdown signal
+    lower = text.lower()
+    if "shutdown" in lower and any(w in lower for w in ("request", "please", "stop", "exit")):
+        return True, None
+
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[codex-bridge {ts}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def _main_loop(
+    team: str,
+    name: str,
+    project: str,
+    profile: str,
+    poll_interval: float,
+    task_timeout: int,
+    tmux_session: Optional[str] = None,
+) -> None:
+    _log(f"Started  team={team}  name={name}  project={project}  profile={profile}")
+    _log(f"Poll every {poll_interval}s, task timeout {task_timeout}s")
+    _log(f"Config   {_config_path(team)}")
+    _log(f"Inbox    {_inbox_path(team, name)}")
+    _log(f"Tasks    {_tasks_dir(team)}/")
+    _log("Waiting for tasks...")
+
+    running = True
+
+    def _on_signal(signum: int, _frame: Any) -> None:
+        nonlocal running
+        _log(f"Signal {signum} received, shutting down")
+        running = False
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    while running:
+        try:
+            # ---- 1. Drain inbox ----
+            messages = _drain_inbox(team, name)
+            inbox_context_parts: list[str] = []
+
+            for msg in messages:
+                is_shutdown, req_id = _is_shutdown_request(msg)
+                if is_shutdown:
+                    _log(f"Shutdown request from {msg.get('from', '?')}")
+                    deregister(team, name)
+                    return
+
+                # Collect context for the next task prompt
+                sender = msg.get("from", "unknown")
+                inbox_context_parts.append(
+                    f"[Message from {sender}]: {msg.get('text', '')}"
+                )
+
+            inbox_context = "\n".join(inbox_context_parts).strip()
+
+            # ---- 2. Scan for pending tasks ----
+            tasks = _scan_pending_tasks(team, name)
+            if not tasks:
+                time.sleep(poll_interval)
+                continue
+
+            # ---- 3. Pick first pending task ----
+            task = tasks[0]
+            task_id = str(task.get("id", "?"))
+            subject = task.get("subject", "(no subject)")
+            description = task.get("description", "")
+
+            _log(f">>> Task #{task_id}: {subject}")
+
+            # ---- 4. Mark in_progress ----
+            _update_task(team, task_id, {"status": "in_progress"})
+
+            # ---- 5. Build prompt & select profile ----
+            effective_profile = _select_profile(subject, description, profile)
+            prompt = _build_prompt(subject, description, inbox_context)
+
+            _log(f"    profile={effective_profile}")
+
+            # ---- 6. Run Codex via agentctl ----
+            result = _run_codex_task(project, effective_profile, prompt, task_timeout,
+                                     tmux_session=tmux_session)
+
+            goal = result.get("goal_met")
+            _log(f"    result: goal_met={goal}  run_id={result.get('run_id', '?')}")
+
+            # ---- 7. Report result ----
+            _report_result(team, name, task_id, subject, result)
+
+        except Exception as exc:
+            _log(f"ERROR in main loop: {exc}")
+            time.sleep(poll_interval)
+
+    # Graceful exit
+    deregister(team, name)
+    _log("Stopped.")
+
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+def _wait_for_team(team: str, poll_interval: float) -> None:
+    """Block until the team config file exists (created by TeamCreate)."""
+    cfg = _config_path(team)
+    while not cfg.exists():
+        _log(f"Waiting for team '{team}' to be created...")
+        time.sleep(poll_interval)
+    time.sleep(1)  # let TeamCreate finish writing
+    _log(f"Team '{team}' detected")
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    team: str = args.team
+    name: str = args.name
+    project: str = args.project
+
+    # Resolve project directory for registration metadata
+    proj_path = Path(project).expanduser().resolve()
+    cwd = str(proj_path) if proj_path.is_dir() else os.getcwd()
+
+    # Wait for team to exist (supports --bridge mode where team is created later)
+    _wait_for_team(team, args.poll_interval)
+
+    _log(f"Joining team={team} as name={name}")
+    register(team, name, cwd)
+    _log("Registered ✓")
+
+    _main_loop(
+        team=team,
+        name=name,
+        project=project,
+        profile=args.profile,
+        poll_interval=args.poll_interval,
+        task_timeout=args.task_timeout,
+        tmux_session=getattr(args, "tmux_session", None),
+    )
+    return 0
+
+
+def cmd_leave(args: argparse.Namespace) -> int:
+    team: str = args.team
+    name: str = args.name
+
+    _log(f"Leaving team={team} as name={name}")
+    deregister(team, name)
+    _log("Deregistered (isActive=false) ✓")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-bridge",
+        description="Codex CLI as a Claude Code team member. "
+                    "Polls the team task list and executes tasks via agentctl.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # -- join --
+    sp = sub.add_parser(
+        "join",
+        help="Join a Claude Code team and start processing tasks.",
+    )
+    sp.add_argument("--team", required=True, help="Team name (must already exist)")
+    sp.add_argument("--name", default="codex-worker",
+                    help="Worker name in team (default: codex-worker)")
+    sp.add_argument("--project", required=True,
+                    help="Project name (registered in agentctl) or filesystem path")
+    sp.add_argument("--profile", default=DEFAULT_PROFILE,
+                    help=f"Default Codex profile (default: {DEFAULT_PROFILE})")
+    sp.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
+                    help=f"Seconds between polls (default: {DEFAULT_POLL_INTERVAL})")
+    sp.add_argument("--task-timeout", type=int, default=DEFAULT_TASK_TIMEOUT,
+                    help=f"Max seconds per task (default: {DEFAULT_TASK_TIMEOUT})")
+    sp.add_argument("--tmux-session", default=None,
+                    help="tmux session for Codex panes (default: auto-detect)")
+    sp.set_defaults(func=cmd_join)
+
+    # -- leave --
+    sp = sub.add_parser(
+        "leave",
+        help="Gracefully leave a team (sets isActive=false).",
+    )
+    sp.add_argument("--team", required=True, help="Team name")
+    sp.add_argument("--name", default="codex-worker",
+                    help="Worker name (default: codex-worker)")
+    sp.set_defaults(func=cmd_leave)
+
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

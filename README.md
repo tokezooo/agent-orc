@@ -85,11 +85,13 @@ agentctl add-project backend ~/projects/backend --default-profile deep
 ```bash
 tmux new -s ai
 bin/orch                    # starts Claude Code with orchestrator prompt
-# or
 bin/orch ~/projects/myapp   # start in a specific directory
+bin/orch --bridge           # auto-start codex-bridge in a tmux pane
 ```
 
-Now give Claude Code a task. It will decompose it and spawn Codex agents automatically.
+With `--bridge`, a single command sets up everything: Claude Code on the left, codex-bridge on the right, connected via an auto-generated team. Just give Claude Code a task and it will delegate to the Codex worker automatically.
+
+Without `--bridge`, give Claude Code a task and it will decompose it and spawn Codex agents via `agentctl`.
 
 ## How It Works
 
@@ -225,6 +227,72 @@ When a run finishes, `agentctl` writes to `.ai-orch/notify.log` and optionally s
 
 - `tmux_notify_target` &mdash; tmux `display-message` target (status bar flash)
 - `tmux_sendkeys_target` &mdash; tmux `send-keys` target (injects text into orchestrator pane to wake it up)
+
+## Codex Bridge (Team Integration)
+
+`codex-bridge` lets a Codex CLI agent join a [Claude Code agent team](https://docs.anthropic.com/en/docs/claude-code) as a full teammate. It polls the team's file-based protocol (task list + inboxes) and translates assigned tasks into `agentctl` runs.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Claude Code Team                                         │
+│                                                          │
+│  ┌────────────────┐    task files     ┌───────────────┐  │
+│  │  Claude Code    │ ──────────────▶ │  codex-bridge  │  │
+│  │  (team lead)    │ ◀────────────── │  (daemon)      │  │
+│  │                 │   inbox msgs     │                │  │
+│  │  TaskCreate     │                  │  agentctl      │  │
+│  │  owner=codex-w  │                  │  start / wait  │  │
+│  └────────────────┘                  └───────┬───────┘  │
+│                                              │          │
+│                                      ┌───────▼───────┐  │
+│                                      │  Codex CLI     │  │
+│                                      │  (tmux pane)   │  │
+│                                      └───────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Quick start
+
+```bash
+# Terminal 1: Start Claude Code with a team
+claude --team my-project
+
+# Terminal 2: Start the bridge
+bin/codex-bridge join \
+  --team my-project \
+  --name codex-worker \
+  --project ~/projects/myapp \
+  --profile spark
+
+# Now in Claude Code, assign tasks to the bridge:
+#   TaskCreate(subject="Fix auth bug", owner="codex-worker")
+# The bridge picks it up, runs Codex, and reports back via inbox.
+```
+
+### Commands
+
+```bash
+# Join a team and start polling (blocks, Ctrl-C to stop)
+codex-bridge join --team <name> --name <worker> --project <path-or-name> \
+  [--profile spark] [--poll-interval 3] [--task-timeout 600]
+
+# Gracefully leave (sets isActive=false in team config)
+codex-bridge leave --team <name> --name <worker>
+```
+
+### How it works
+
+1. Registers as a member in `~/.claude/teams/{team}/config.json`
+2. Polls `~/.claude/tasks/{team}/*.json` for tasks with `owner == name` and `status == pending`
+3. Sets task to `in_progress`, builds a prompt from `subject` + `description`
+4. Runs `agentctl start --project X --profile Y` and waits via `agentctl wait`
+5. On success (`goal_met: true`) &rarr; sets task `status: completed`
+6. Posts result summary to the team lead's inbox
+7. Handles `shutdown_request` messages &rarr; deregisters and exits
+
+### Profile auto-selection
+
+The bridge auto-selects the `deep` profile when the task text contains keywords like *refactor*, *plan*, *complex*, *architect*, *redesign*, *migration*, or *rewrite*. Otherwise it uses the default profile (usually `spark`).
 
 ## License
 
