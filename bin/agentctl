@@ -23,14 +23,18 @@ import argparse
 import datetime as _dt
 import json
 import os
-import random
 import re
+import secrets
 import shlex
 import string
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+MAX_PROMPT_SIZE = 10 * 1024 * 1024  # 10 MiB limit for stdin prompts
+_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 def _now_iso() -> str:
@@ -39,7 +43,7 @@ def _now_iso() -> str:
 
 def _short_rand(n: int = 6) -> str:
     alphabet = string.ascii_lowercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
+    return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
 def _default_home() -> Path:
@@ -64,19 +68,25 @@ def _paths(home: Path) -> Dict[str, Path]:
 def _load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, IOError, UnicodeDecodeError) as exc:
+        print(f"warning: failed to load {path}: {exc}", file=sys.stderr)
+        return default
 
 
 def _save_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.rename(str(tmp), str(path))
 
 
 def _have_tmux() -> bool:
     try:
         subprocess.run(["tmux", "-V"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return False
 
 
@@ -85,7 +95,7 @@ def _tmux_display_message(target: str, msg: str) -> None:
         return
     try:
         subprocess.run(["tmux", "display-message", "-t", target, msg], check=False)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -96,7 +106,7 @@ def _tmux_send_keys(target: str, text: str, *, enter: bool = False) -> None:
         subprocess.run(["tmux", "send-keys", "-t", target, text], check=False)
         if enter:
             subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -106,7 +116,7 @@ def _current_tmux_session() -> Optional[str]:
     try:
         out = subprocess.check_output(["tmux", "display-message", "-p", "#S"], text=True).strip()
         return out or None
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return None
 
 
@@ -119,7 +129,7 @@ def _safe_tmux_name(s: str, max_len: int = 40) -> str:
 
 def _read_prompt(prompt_file: str) -> str:
     if prompt_file == "-":
-        return sys.stdin.read()
+        return sys.stdin.read(MAX_PROMPT_SIZE)
     return Path(prompt_file).expanduser().read_text(encoding="utf-8")
 
 
@@ -183,9 +193,10 @@ def cmd_add_project(args: argparse.Namespace) -> int:
     p = _ensure_init(home)
     data = _load_json(p["projects"], {"projects": {}})
 
-    proj_path = Path(args.path).expanduser().resolve()
-    if not proj_path.exists():
-        print(f"❌ path does not exist: {proj_path}", file=sys.stderr)
+    try:
+        proj_path = Path(args.path).expanduser().resolve(strict=True)
+    except OSError:
+        print(f"❌ path does not exist: {Path(args.path).expanduser()}", file=sys.stderr)
         return 2
 
     data.setdefault("projects", {})
@@ -217,11 +228,13 @@ def _resolve_project(args: argparse.Namespace, projects_path: Path) -> Tuple[str
         if proj:
             return project_arg, Path(proj["path"]), proj.get("default_profile")
         # Treat as path
-        proj_dir = Path(project_arg).expanduser().resolve()
+        try:
+            proj_dir = Path(project_arg).expanduser().resolve(strict=True)
+        except OSError:
+            raise ValueError(f"'{project_arg}' is not a registered project or valid directory.")
         if proj_dir.is_dir():
             return proj_dir.name, proj_dir, None
-        print(f"Error: '{project_arg}' is not a registered project or valid directory.", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError(f"'{project_arg}' is not a registered project or valid directory.")
 
     # Default: current working directory
     proj_dir = Path.cwd().resolve()
@@ -233,7 +246,7 @@ def _write_run_meta(run_dir: Path, meta: Dict[str, Any]) -> None:
 
 
 def _new_run_id() -> str:
-    return f"{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_short_rand(4)}"
+    return f"{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_short_rand(6)}"
 
 
 def _build_codex_command(
@@ -340,17 +353,23 @@ def _spawn_tmux_pane(
     # Split horizontally from the target window — new pane appears on the right
     subprocess.run(
         ["tmux", "split-window", "-h", "-t", tmux_target,
-         "-c", str(cwd), "bash", str(script_path)],
-        check=True,
+         "-c", str(cwd), "-P", "-F", "#{pane_id}",
+         "bash", str(script_path)],
+        check=True, capture_output=True, text=True,
     )
-    # Keep finished panes open for inspection
-    subprocess.run(["tmux", "set-option", "-t", tmux_target, "remain-on-exit", "on"], check=False)
-    # Set main pane width (orchestrator)
-    subprocess.run(["tmux", "set-option", "-t", tmux_target, "main-pane-width", main_pane_width], check=False)
-    # Rebalance: main-vertical = pane 0 left, rest stacked right
-    subprocess.run(["tmux", "select-layout", "-t", tmux_target, "main-vertical"], check=False)
-    # Return focus to the orchestrator pane (pane 0)
-    subprocess.run(["tmux", "select-pane", "-t", f"{tmux_target}.0"], check=False)
+    try:
+        # Keep finished panes open for inspection
+        subprocess.run(["tmux", "set-option", "-t", tmux_target, "remain-on-exit", "on"], check=False)
+        # Set main pane width (orchestrator)
+        subprocess.run(["tmux", "set-option", "-t", tmux_target, "main-pane-width", main_pane_width], check=False)
+        # Rebalance: main-vertical = pane 0 left, rest stacked right
+        subprocess.run(["tmux", "select-layout", "-t", tmux_target, "main-vertical"], check=False)
+        # Return focus to the orchestrator pane (pane 0)
+        subprocess.run(["tmux", "select-pane", "-t", f"{tmux_target}.0"], check=False)
+    except (OSError, subprocess.SubprocessError):
+        # Best-effort cleanup: kill the pane we just created
+        subprocess.run(["tmux", "kill-pane", "-t", tmux_target], check=False)
+        raise
 
 
 def _start_common(
@@ -408,21 +427,22 @@ def _start_common(
                 "",
                 "# Watchdog: auto-kill Codex after result.json appears",
                 'RESULT_FILE="$RUN_DIR/result.json"',
-                'SCRIPT_PID=$$',
+                "",
+                "set +e",
+                f'{codex_cmd} {_run_redirects(headless=args.headless, json_events=args.json_events, events_file=events_file, stderr_file=stderr_file, prompt_file=prompt_file)} &',
+                'CODEX_PID=$!',
                 '(',
                 '  while true; do',
                 '    sleep 5',
                 '    if [ -f "$RESULT_FILE" ]; then',
                 '      sleep 3  # grace period',
-                '      pkill -P "$SCRIPT_PID" -f codex 2>/dev/null || true',
+                '      kill "$CODEX_PID" 2>/dev/null || true',
                 '      break',
                 '    fi',
                 '  done',
                 ') &',
                 'WATCHDOG_PID=$!',
-                "",
-                "set +e",
-                f'{codex_cmd} {_run_redirects(headless=args.headless, json_events=args.json_events, events_file=events_file, stderr_file=stderr_file, prompt_file=prompt_file)}',
+                'wait $CODEX_PID 2>/dev/null',
                 "EC=$?",
                 'kill $WATCHDOG_PID 2>/dev/null; wait $WATCHDOG_PID 2>/dev/null',
                 "set -e",
@@ -452,10 +472,17 @@ def cmd_start(args: argparse.Namespace) -> int:
     home = _default_home()
     p = _ensure_init(home)
     cfg = _load_json(p["config"], {})
-    proj_name, proj_dir, default_profile = _resolve_project(args, p["projects"])
+    try:
+        proj_name, proj_dir, default_profile = _resolve_project(args, p["projects"])
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     profile = args.profile or default_profile or "spark"
     run_id = args.run_id or _new_run_id()
+    if not _RUN_ID_RE.match(run_id):
+        print(f"Error: invalid run-id format: {run_id!r}", file=sys.stderr)
+        return 2
     run_dir = p["runs"] / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -543,6 +570,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     profile = args.profile or parent_meta.get("profile") or "spark"
     run_id = args.run_id or _new_run_id()
+    if not _RUN_ID_RE.match(run_id):
+        print(f"Error: invalid run-id format: {run_id!r}", file=sys.stderr)
+        return 2
     run_dir = p["runs"] / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -628,7 +658,7 @@ def _extract_thread_id(events_path: Path) -> Optional[str]:
                     tid = obj["thread"].get("id")
                     if isinstance(tid, str) and tid:
                         return tid
-    except Exception:
+    except (IOError, UnicodeDecodeError):
         return None
     return None
 
@@ -649,7 +679,7 @@ def _git_diff_stat(repo: Path) -> Optional[str]:
     try:
         out = subprocess.check_output(["git", "-C", str(repo), "diff", "--stat"], text=True, stderr=subprocess.DEVNULL).strip()
         return out or ""
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return None
 
 
@@ -701,7 +731,8 @@ def cmd_on_finish(args: argparse.Namespace) -> int:
         line += f" — {summary}"
     line += "\n"
 
-    p["notify_log"].write_text(p["notify_log"].read_text(encoding="utf-8") + line, encoding="utf-8")
+    with p["notify_log"].open("a", encoding="utf-8") as f:
+        f.write(line)
 
     tmux_target = cfg.get("tmux_notify_target") or f"{cfg.get('tmux_session','ai')}:0"
     _tmux_display_message(tmux_target, line.strip())
@@ -753,8 +784,6 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_wait(args: argparse.Namespace) -> int:
     """Block until run finishes, then print result JSON. Designed to be run in background."""
-    import time
-
     home = _default_home()
     p = _ensure_init(home)
     run_id = args.run_id
@@ -800,7 +829,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
                     sys.stdout.write(line)
                     sys.stdout.flush()
                 else:
-                    subprocess.run(["bash", "-lc", "sleep 0.2"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    time.sleep(0.2)
         except KeyboardInterrupt:
             return 0
 

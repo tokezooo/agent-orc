@@ -35,6 +35,8 @@ TEAMS_DIR = CLAUDE_HOME / "teams"
 TASKS_DIR = CLAUDE_HOME / "tasks"
 
 AGENTCTL = Path(__file__).resolve().parent / "agentctl"
+if not AGENTCTL.exists():
+    raise FileNotFoundError(f"agentctl not found at {AGENTCTL}")
 
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_TASK_TIMEOUT = 600
@@ -201,6 +203,8 @@ def _drain_inbox(team: str, name: str) -> List[Dict[str, Any]]:
     """Atomically read and clear the inbox, returning all messages."""
     ib = _inbox_path(team, name)
     with FileLock(ib):
+        if not ib.exists():
+            _write_json_atomic(ib, [])
         messages = _read_json(ib, [])
         if messages:
             _write_json_atomic(ib, [])
@@ -230,7 +234,8 @@ def _scan_pending_tasks(team: str, owner: str) -> List[Dict[str, Any]]:
 
     result: list[Dict[str, Any]] = []
     for fpath in sorted(tdir.glob("*.json")):
-        task = _read_json(fpath)
+        with FileLock(fpath):
+            task = _read_json(fpath)
         if not isinstance(task, dict):
             continue
         if task.get("owner") != owner:
@@ -243,7 +248,9 @@ def _scan_pending_tasks(team: str, owner: str) -> List[Dict[str, Any]]:
         if blocked_by:
             all_resolved = True
             for bid in blocked_by:
-                blocker = _read_json(tdir / f"{bid}.json")
+                blocker_path = tdir / f"{bid}.json"
+                with FileLock(blocker_path):
+                    blocker = _read_json(blocker_path)
                 if blocker and blocker.get("status") != "completed":
                     all_resolved = False
                     break
@@ -260,6 +267,8 @@ def _update_task(team: str, task_id: str, updates: Dict[str, Any]) -> None:
     task_path = _tasks_dir(team) / f"{task_id}.json"
     with FileLock(task_path):
         task = _read_json(task_path, {})
+        if not task:
+            raise FileNotFoundError(f"Task {task_id} does not exist at {task_path}")
         task.update(updates)
         _write_json_atomic(task_path, task)
 
@@ -317,43 +326,57 @@ def _run_codex_task(
         ]
         if tmux_session:
             cmd.extend(["--tmux-session", tmux_session])
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
         )
+        try:
+            stdout, stderr = proc.communicate(input=prompt, timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return {"goal_met": False, "summary": "agentctl start timed out (30s)"}
         if proc.returncode != 0:
             return {
                 "goal_met": False,
                 "summary": f"agentctl start failed (rc={proc.returncode}): "
-                           f"{proc.stderr.strip()[:300]}",
+                           f"{stderr.strip()[:300]}",
             }
-        run_id = proc.stdout.strip()
+        run_id = stdout.strip()
         if not run_id:
             return {"goal_met": False, "summary": "agentctl start returned empty run_id"}
-    except subprocess.TimeoutExpired:
-        return {"goal_met": False, "summary": "agentctl start timed out (30s)"}
     except Exception as exc:
         return {"goal_met": False, "summary": f"agentctl start error: {exc}"}
 
     # --- agentctl wait ---
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 sys.executable, str(AGENTCTL),
                 "wait", run_id, "--timeout", str(timeout),
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout + 60,
         )
-        stdout = proc.stdout.strip()
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout + 60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return {
+                "goal_met": False,
+                "summary": f"agentctl wait timed out after {timeout}s",
+                "run_id": run_id,
+            }
+        stdout = stdout.strip()
         if proc.returncode != 0 and not stdout:
             return {
                 "goal_met": False,
-                "summary": f"agentctl wait failed: {proc.stderr.strip()[:300]}",
+                "summary": f"agentctl wait failed: {stderr.strip()[:300]}",
                 "run_id": run_id,
             }
         try:
@@ -372,12 +395,6 @@ def _run_codex_task(
             "exit_code": meta.get("exit_code"),
             "git_diff_stat": meta.get("git_diff_stat", ""),
             "profile": meta.get("profile"),
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "goal_met": False,
-            "summary": f"agentctl wait timed out after {timeout}s",
-            "run_id": run_id,
         }
     except Exception as exc:
         return {
@@ -407,7 +424,12 @@ def _report_result(
     # Update task status
     if goal_met:
         _update_task(team, task_id, {"status": "completed"})
-    # If failed, leave as in_progress so the leader can inspect / reassign.
+    else:
+        _update_task(team, task_id, {
+            "status": "failed",
+            "error": summary[:500],
+            "failed_at": _now_iso(),
+        })
 
     # Build inbox message
     tag = "COMPLETED" if goal_met else "FAILED"
@@ -433,7 +455,9 @@ def _report_result(
     if leader:
         _post_to_inbox(team, leader, msg)
     else:
-        _log("No leader found; result not sent to inbox")
+        _log("No leader found; writing result to fallback file")
+        fallback = _tasks_dir(team) / f"{task_id}_result.json"
+        _write_json_atomic(fallback, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -447,18 +471,13 @@ def _is_shutdown_request(msg: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     text = msg.get("text", "")
 
-    # Try JSON-encoded protocol message
+    # Require explicit JSON protocol message only
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and parsed.get("type") == "shutdown_request":
             return True, parsed.get("requestId") or parsed.get("request_id")
     except (json.JSONDecodeError, TypeError):
         pass
-
-    # Heuristic: plain-text shutdown signal
-    lower = text.lower()
-    if "shutdown" in lower and any(w in lower for w in ("request", "please", "stop", "exit")):
-        return True, None
 
     return False, None
 
@@ -523,7 +542,37 @@ def _main_loop(
 
             inbox_context = "\n".join(inbox_context_parts).strip()
 
-            # ---- 2. Scan for pending tasks ----
+            # ---- 2a. Watchdog: reset abandoned in_progress tasks ----
+            abandon_limit = 2 * task_timeout
+            tdir = _tasks_dir(team)
+            if tdir.exists():
+                for fpath in tdir.glob("*.json"):
+                    with FileLock(fpath):
+                        t = _read_json(fpath)
+                    if (
+                        isinstance(t, dict)
+                        and t.get("owner") == name
+                        and t.get("status") == "in_progress"
+                        and t.get("started_at")
+                    ):
+                        try:
+                            started = datetime.fromisoformat(
+                                t["started_at"].replace("Z", "+00:00")
+                            )
+                            elapsed = (
+                                datetime.now(timezone.utc) - started
+                            ).total_seconds()
+                            if elapsed > abandon_limit:
+                                _log(f"Watchdog: resetting abandoned task {t.get('id')}")
+                                tid = str(t.get("id"))
+                                _update_task(team, tid, {
+                                    "status": "pending",
+                                    "started_at": None,
+                                })
+                        except (ValueError, TypeError):
+                            pass
+
+            # ---- 2b. Scan for pending tasks ----
             tasks = _scan_pending_tasks(team, name)
             if not tasks:
                 time.sleep(poll_interval)
@@ -538,7 +587,10 @@ def _main_loop(
             _log(f">>> Task #{task_id}: {subject}")
 
             # ---- 4. Mark in_progress ----
-            _update_task(team, task_id, {"status": "in_progress"})
+            _update_task(team, task_id, {
+                "status": "in_progress",
+                "started_at": _now_iso(),
+            })
 
             # ---- 5. Build prompt & select profile ----
             effective_profile = _select_profile(subject, description, profile)
@@ -556,7 +608,8 @@ def _main_loop(
             # ---- 7. Report result ----
             _report_result(team, name, task_id, subject, result)
 
-        except Exception as exc:
+        except (IOError, json.JSONDecodeError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired, FileNotFoundError) as exc:
             _log(f"ERROR in main loop: {exc}")
             time.sleep(poll_interval)
 

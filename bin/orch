@@ -8,8 +8,8 @@
 #   orch --bridge           # auto-start codex-bridge in a tmux pane
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ORCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ORCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 AGENTCTL="$SCRIPT_DIR/agentctl"
 BRIDGE="$SCRIPT_DIR/codex-bridge"
 PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator.md"
@@ -60,7 +60,7 @@ fi
 
 if [ "$BRIDGE_MODE" = true ]; then
     # Generate a unique team name
-    TEAM="orch-$(head -c 4 /dev/urandom | xxd -p | head -c 4)"
+    TEAM="orch-$(head -c 8 /dev/urandom | xxd -p | head -c 8)"
 
     # Verify we're inside tmux
     if [ -z "${TMUX:-}" ]; then
@@ -72,9 +72,13 @@ if [ "$BRIDGE_MODE" = true ]; then
     # Capture the current tmux session so the bridge spawns Codex panes here
     TMUX_SESSION="$(tmux display-message -p '#S')"
 
+    # Capture project dir safely to avoid command injection in tmux command
+    PROJECT_DIR="$(pwd)"
+    ESCAPED_PROJECT_DIR="$(printf '%q' "$PROJECT_DIR")"
+
     # Spawn codex-bridge in a right-side tmux pane (waits for team to appear)
-    tmux split-window -h -d \
-        "python3 '$BRIDGE' join --team '$TEAM' --name codex-worker --project '$(pwd)' --tmux-session '$TMUX_SESSION'"
+    BRIDGE_PANE="$(tmux split-window -h -d -P -F '#{pane_id}' \
+        "python3 '$BRIDGE' join --team '$TEAM' --name codex-worker --project $ESCAPED_PROJECT_DIR --tmux-session '$TMUX_SESSION'")"
 
     # Append bridge instructions to the system prompt
     SYSTEM_PROMPT="$SYSTEM_PROMPT
@@ -102,9 +106,10 @@ Use agentctl only for 'agentctl show <run_id>' to inspect past results if needed
         claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}" "$INIT_PROMPT"
     fi
 
-    # Cleanup: tell bridge to leave
+    # Cleanup: tell bridge to leave and kill its tmux pane
     echo "Shutting down codex-bridge (team=$TEAM)..."
     python3 "$BRIDGE" leave --team "$TEAM" --name codex-worker 2>/dev/null || true
+    tmux kill-pane -t "$BRIDGE_PANE" 2>/dev/null || true
     exit 0
 fi
 
