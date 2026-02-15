@@ -38,6 +38,8 @@ AGENTCTL = Path(__file__).resolve().parent / "agentctl"
 if not AGENTCTL.exists():
     raise FileNotFoundError(f"agentctl not found at {AGENTCTL}")
 
+ORCH_HOME = AGENTCTL.parent.parent / ".ai-orch"
+
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_TASK_TIMEOUT = 600
 DEFAULT_PROFILE = "spark"
@@ -314,6 +316,7 @@ def _run_codex_task(
     prompt: str,
     timeout: int,
     tmux_session: Optional[str] = None,
+    use_worktree: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Start a Codex run via ``agentctl start`` and block on ``agentctl wait``."""
 
@@ -326,6 +329,10 @@ def _run_codex_task(
         ]
         if tmux_session:
             cmd.extend(["--tmux-session", tmux_session])
+        if use_worktree is True:
+            cmd.append("--worktree")
+        elif use_worktree is False:
+            cmd.append("--no-worktree")
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -388,7 +395,7 @@ def _run_codex_task(
                 "run_id": run_id,
                 "raw_output": stdout[:500],
             }
-        return {
+        result_dict: Dict[str, Any] = {
             "goal_met": meta.get("goal_met", False),
             "summary": meta.get("summary", "No summary"),
             "run_id": run_id,
@@ -396,6 +403,9 @@ def _run_codex_task(
             "git_diff_stat": meta.get("git_diff_stat", ""),
             "profile": meta.get("profile"),
         }
+        if meta.get("worktree_branch"):
+            result_dict["worktree_branch"] = meta["worktree_branch"]
+        return result_dict
     except Exception as exc:
         return {
             "goal_met": False,
@@ -437,6 +447,9 @@ def _report_result(
     text_lines.append(f"Summary: {summary}")
     if git_info:
         text_lines.append(f"Git: {git_info}")
+    wt_branch = result.get("worktree_branch")
+    if wt_branch:
+        text_lines.append(f"Worktree branch: {wt_branch}")
     run_id = result.get("run_id")
     if run_id:
         text_lines.append(f"Run: {run_id}")
@@ -495,6 +508,34 @@ def _log(msg: str) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _load_orch_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load global config and projects from .ai-orch."""
+    config_path = ORCH_HOME / "config.json"
+    projects_path = ORCH_HOME / "projects.json"
+    config = _read_json(config_path, {})
+    projects_data = _read_json(projects_path, {"projects": {}})
+    return config, projects_data
+
+
+def _resolve_worktree_setting(
+    orch_config: Dict[str, Any],
+    projects_data: Dict[str, Any],
+    project: str,
+) -> Optional[bool]:
+    """Evaluate worktree config for a project.
+
+    Returns True/False if configured, None if not set anywhere.
+    """
+    # Check per-project override
+    proj = projects_data.get("projects", {}).get(project, {})
+    if isinstance(proj, dict) and "worktrees_enabled" in proj:
+        return bool(proj["worktrees_enabled"])
+    # Check global config
+    if "worktrees_enabled" in orch_config:
+        return bool(orch_config["worktrees_enabled"])
+    return None
+
+
 def _main_loop(
     team: str,
     name: str,
@@ -509,6 +550,15 @@ def _main_loop(
     _log(f"Config   {_config_path(team)}")
     _log(f"Inbox    {_inbox_path(team, name)}")
     _log(f"Tasks    {_tasks_dir(team)}/")
+
+    # Load worktree configuration once at startup
+    orch_config, projects_data = _load_orch_config()
+    use_worktree = _resolve_worktree_setting(orch_config, projects_data, project)
+    if use_worktree:
+        _log("Worktrees: enabled")
+    else:
+        _log("Worktrees: disabled")
+
     _log("Waiting for tasks...")
 
     running = True
@@ -600,7 +650,8 @@ def _main_loop(
 
             # ---- 6. Run Codex via agentctl ----
             result = _run_codex_task(project, effective_profile, prompt, task_timeout,
-                                     tmux_session=tmux_session)
+                                     tmux_session=tmux_session,
+                                     use_worktree=use_worktree)
 
             goal = result.get("goal_met")
             _log(f"    result: goal_met={goal}  run_id={result.get('run_id', '?')}")

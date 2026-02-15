@@ -90,6 +90,51 @@ When to use bridge vs teammate:
 - **Bridge**: quick edits, lint/format, simple bug fixes, boilerplate generation
 - **Teammate**: tasks requiring dialogue, tool use, MCP access, complex logic
 
+## Git worktree isolation
+
+When multiple agents edit the same repo in parallel, file conflicts can occur. Git worktrees
+give each agent an isolated directory and branch while sharing one `.git` store.
+
+### Configuration
+
+Worktrees are **off by default**. Enable globally in `.ai-orch/config.json`:
+```json
+{ "worktrees_enabled": true }
+```
+Per-project override in `.ai-orch/projects.json` (under each project object).
+CLI flags `--worktree` / `--no-worktree` take highest priority.
+
+### When to use worktrees
+- **Parallel tasks on different modules**: each agent gets its own branch, no conflicts.
+- **Long-running deep tasks**: isolate from other changes happening on the main branch.
+
+### When NOT to use worktrees
+- **Same-file edits**: merging will still conflict; serialize these instead.
+- **Sequential tasks**: no parallelism, no benefit.
+- **Non-git projects**: worktrees require a git repository.
+
+### Commands
+
+```
+# Merge a worktree branch back into base
+agentctl merge <run_id>                    # regular merge
+agentctl merge <run_id> --strategy squash  # squash merge
+
+# Clean up worktree directories + branches
+agentctl worktree-cleanup                  # all finished runs
+agentctl worktree-cleanup <run_id>         # specific run
+agentctl worktree-cleanup --force          # force-remove despite uncommitted changes
+agentctl worktree-cleanup --keep-branch    # remove directory but keep branch
+```
+
+### Workflow
+1. Enable worktrees (config or `--worktree` flag).
+2. `agentctl start` creates a worktree at `<repo>/../<proj>-wt-<run_id>/` on branch `wt/<run_id>`.
+3. Agent works in the isolated directory.
+4. After the run finishes: `agentctl merge <run_id>` to bring changes back.
+5. `agentctl worktree-cleanup <run_id>` to remove the directory and branch.
+6. The bridge worker (`codex-bridge`) automatically reads the worktree config and passes the flag.
+
 Important:
 - Do not make changes in repos yourself; delegate to Codex.
 - If a task lacks clear criteria, formalize them in the prompt yourself.
