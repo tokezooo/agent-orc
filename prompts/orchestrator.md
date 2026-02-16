@@ -71,24 +71,76 @@ Bash (run_in_background: true): python3 <agentctl> wait <run_id3>
 For tasks requiring tool use, MCP integrations, multi-turn reasoning, browser automation.
 Launched through the standard Claude Code teams mechanism.
 
-### Codex bridge worker (via codex-bridge daemon)
+### Bridge workers (via codex-bridge or claude-bridge daemon)
 For quick edits, bulk operations, parallel code work.
-The bridge is an external process that polls the task list and executes tasks via agentctl.
+The bridge is an external process that polls the task list and executes tasks automatically.
+
+Two bridge engines are available:
+- **codex-bridge**: Uses Codex CLI via agentctl. Best for quick edits, bulk operations.
+- **claude-bridge**: Uses Claude Code CLI (`claude -p`). Best for tasks needing Claude's capabilities without MCP/tool use.
+
+Select the bridge engine when launching: `orch --bridge --bridge-engine codex|claude`
 
 Working with the bridge:
 ```
-# Bridge is already running: codex-bridge join --team <team> --name codex-worker --project <proj>
+# Bridge is already running (started by orch --bridge)
+# Worker name depends on engine: "codex-worker" or "claude-worker"
 
 # Just create a task with owner — the bridge picks it up automatically:
 TaskCreate(subject="Fix null check in auth.ts", description="...", owner="codex-worker")
 
 # The result will arrive in your inbox automatically.
-# For complex tasks the bridge will switch to the deep profile on its own.
+# For complex tasks the bridge will auto-select a more powerful profile/model.
 ```
 
 When to use bridge vs teammate:
-- **Bridge**: quick edits, lint/format, simple bug fixes, boilerplate generation
-- **Teammate**: tasks requiring dialogue, tool use, MCP access, complex logic
+- **Bridge**: quick edits, lint/format, simple bug fixes, boilerplate generation, parallel code work
+- **Teammate**: tasks requiring dialogue, tool use, MCP access, complex multi-turn logic
+
+## Git worktree isolation
+
+When multiple agents edit the same repo in parallel, file conflicts can occur. Git worktrees
+give each agent an isolated directory and branch while sharing one `.git` store.
+
+### Configuration
+
+Worktrees are **off by default**. Enable globally in `.ai-orch/config.json`:
+```json
+{ "worktrees_enabled": true }
+```
+Per-project override in `.ai-orch/projects.json` (under each project object).
+CLI flags `--worktree` / `--no-worktree` take highest priority.
+
+### When to use worktrees
+- **Parallel tasks on different modules**: each agent gets its own branch, no conflicts.
+- **Long-running deep tasks**: isolate from other changes happening on the main branch.
+
+### When NOT to use worktrees
+- **Same-file edits**: merging will still conflict; serialize these instead.
+- **Sequential tasks**: no parallelism, no benefit.
+- **Non-git projects**: worktrees require a git repository.
+
+### Commands
+
+```
+# Merge a worktree branch back into base
+agentctl merge <run_id>                    # regular merge
+agentctl merge <run_id> --strategy squash  # squash merge
+
+# Clean up worktree directories + branches
+agentctl worktree-cleanup                  # all finished runs
+agentctl worktree-cleanup <run_id>         # specific run
+agentctl worktree-cleanup --force          # force-remove despite uncommitted changes
+agentctl worktree-cleanup --keep-branch    # remove directory but keep branch
+```
+
+### Workflow
+1. Enable worktrees (config or `--worktree` flag).
+2. `agentctl start` creates a worktree at `<repo>/../<proj>-wt-<run_id>/` on branch `wt/<run_id>`.
+3. Agent works in the isolated directory.
+4. After the run finishes: `agentctl merge <run_id>` to bring changes back.
+5. `agentctl worktree-cleanup <run_id>` to remove the directory and branch.
+6. The bridge worker (`codex-bridge`) automatically reads the worktree config and passes the flag.
 
 Important:
 - Do not make changes in repos yourself; delegate to Codex.

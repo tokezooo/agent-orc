@@ -384,13 +384,14 @@ def _start_common(
     title: str,
     parent_run_id: Optional[str] = None,
     resume_session_id: Optional[str] = None,
+    worktree_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     prompt_path = run_dir / "prompt.md"
     if not prompt_path.exists():
         prompt = _read_prompt(args.prompt_file)
         prompt_path.write_text(prompt, encoding="utf-8")
 
-    meta = {
+    meta: Dict[str, Any] = {
         "run_id": run_id,
         "title": title or "",
         "project": proj_name,
@@ -406,6 +407,8 @@ def _start_common(
         "goal_met": None,
         "summary": None,
     }
+    if worktree_meta:
+        meta.update(worktree_meta)
     _write_run_meta(run_dir, meta)
 
     events_file = run_dir / "events.jsonl"
@@ -453,7 +456,8 @@ def _start_common(
                 'echo "[agentctl] done run=$RUN_ID exit=$EC"',
                 f'echo "[agentctl] artifacts: {str(run_dir)}"',
                 '# Auto-close pane when done',
-                'tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || exit 0',
+                'if [ -n "${TMUX_PANE:-}" ]; then tmux kill-pane -t "$TMUX_PANE" 2>/dev/null; fi',
+                'exit 0',
                 "",
             ]
         )
@@ -462,10 +466,20 @@ def _start_common(
     )
     run_sh.chmod(0o755)
 
-    tmux_session = args.tmux_session
-    # Target the orchestrator's window (default: window where orchestrator runs)
-    tmux_target = f"{tmux_session}:{args.tmux_window}" if getattr(args, "tmux_window", None) else tmux_session
-    _spawn_tmux_pane(tmux_target=tmux_target, cwd=proj_dir, script_path=run_sh)
+    if getattr(args, 'no_pane', False):
+        import subprocess as _sp
+        _sp.Popen(
+            ["bash", str(run_sh)],
+            cwd=str(proj_dir),
+            start_new_session=True,
+            stdout=open(run_dir / "stdout.log", "w"),
+            stderr=open(run_dir / "stderr_pane.log", "w"),
+        )
+    else:
+        tmux_session = args.tmux_session
+        # Target the orchestrator's window (default: window where orchestrator runs)
+        tmux_target = f"{tmux_session}:{args.tmux_window}" if getattr(args, "tmux_window", None) else tmux_session
+        _spawn_tmux_pane(tmux_target=tmux_target, cwd=proj_dir, script_path=run_sh)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -488,6 +502,28 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     tmux_session = args.tmux_session or cfg.get("tmux_session") or _current_tmux_session() or "ai"
     args.tmux_session = tmux_session
+
+    # --- Worktree support ---
+    project_data = _get_project(proj_name, p["projects"])
+    cli_wt = getattr(args, "worktree", None)
+    worktree_meta: Optional[Dict[str, Any]] = None
+    original_proj_dir = proj_dir
+
+    if _should_use_worktree(cfg, project_data, cli_wt) and _is_git_repo(proj_dir):
+        try:
+            wt_path, wt_branch, base_branch = _create_worktree(proj_dir, run_id, proj_name)
+            proj_dir = wt_path
+            worktree_meta = {
+                "worktree_enabled": True,
+                "worktree_path": str(wt_path),
+                "worktree_branch": wt_branch,
+                "base_branch": base_branch,
+                "original_project_dir": str(original_proj_dir),
+                "worktree_cleaned": False,
+            }
+            print(f"[worktree] created {wt_path} (branch {wt_branch})", file=sys.stderr)
+        except RuntimeError as exc:
+            print(f"warning: worktree creation failed, using main repo: {exc}", file=sys.stderr)
 
     schema_path = Path(args.output_schema).expanduser() if args.output_schema else p["schema"]
     last_file = run_dir / "last_message.json"
@@ -537,6 +573,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         profile=profile,
         codex_cmd=codex_cmd,
         title=args.title,
+        worktree_meta=worktree_meta,
     )
 
     notify_target = cfg.get("tmux_notify_target", f"{tmux_session}:0")
@@ -567,6 +604,23 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not proj_name or not proj_dir.exists():
         print("❌ could not resolve project from parent run.", file=sys.stderr)
         return 2
+
+    # --- Reuse parent's worktree if it had one ---
+    worktree_meta: Optional[Dict[str, Any]] = None
+    if parent_meta.get("worktree_enabled") and parent_meta.get("worktree_path"):
+        wt_path = Path(parent_meta["worktree_path"])
+        if wt_path.exists():
+            proj_dir = wt_path
+            worktree_meta = {
+                "worktree_enabled": True,
+                "worktree_path": str(wt_path),
+                "worktree_branch": parent_meta.get("worktree_branch", ""),
+                "base_branch": parent_meta.get("base_branch", ""),
+                "original_project_dir": parent_meta.get("original_project_dir", ""),
+                "worktree_cleaned": False,
+            }
+        else:
+            print(f"warning: parent worktree {wt_path} no longer exists, using main repo", file=sys.stderr)
 
     profile = args.profile or parent_meta.get("profile") or "spark"
     run_id = args.run_id or _new_run_id()
@@ -629,6 +683,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         title=args.title,
         parent_run_id=parent_run_id,
         resume_session_id=str(session_id),
+        worktree_meta=worktree_meta,
     )
 
     notify_target = cfg.get("tmux_notify_target", f"{tmux_session}:0")
@@ -683,6 +738,153 @@ def _git_diff_stat(repo: Path) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Git worktree helpers
+# ---------------------------------------------------------------------------
+
+def _is_git_repo(path: Path) -> bool:
+    """Return True if *path* is inside a git repository."""
+    try:
+        subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "--git-dir"],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _get_current_branch(repo: Path) -> Optional[str]:
+    """Return the current branch name, or None if detached/not-a-repo."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        return out if out and out != "HEAD" else None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _create_worktree(repo: Path, run_id: str, proj_name: str) -> Tuple[Path, str, str]:
+    """Create a git worktree for *run_id*.
+
+    Returns (worktree_path, branch_name, base_branch).
+    Raises RuntimeError on failure.
+    """
+    base_branch = _get_current_branch(repo) or "HEAD"
+    branch = f"wt/{run_id}"
+    worktree_path = repo.parent / f"{proj_name}-wt-{run_id}"
+
+    try:
+        subprocess.check_output(
+            ["git", "-C", str(repo), "worktree", "add", "-b", branch,
+             str(worktree_path)],
+            stderr=subprocess.STDOUT, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"git worktree add failed: {exc.output.strip()}"
+        ) from exc
+
+    return worktree_path, branch, base_branch
+
+
+def _remove_worktree(repo: Path, worktree_path: Path, branch: str, force: bool = False) -> None:
+    """Remove a worktree directory and optionally its branch."""
+    cmd = ["git", "-C", str(repo), "worktree", "remove"]
+    if force:
+        cmd.append("--force")
+    cmd.append(str(worktree_path))
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"warning: worktree remove failed: {exc.output.strip()}", file=sys.stderr)
+
+    # Prune stale worktree references
+    try:
+        subprocess.check_output(
+            ["git", "-C", str(repo), "worktree", "prune"],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    # Delete the branch
+    if branch:
+        flag = "-D" if force else "-d"
+        try:
+            subprocess.check_output(
+                ["git", "-C", str(repo), "branch", flag, branch],
+                stderr=subprocess.DEVNULL, text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+
+def _merge_worktree_branch(
+    repo: Path, branch: str, base_branch: str, strategy: str = "merge"
+) -> Tuple[bool, str]:
+    """Merge (or squash-merge) *branch* into *base_branch* in *repo*.
+
+    Returns (success, message).  On conflict: aborts merge and returns False.
+    """
+    # Ensure we're on the base branch
+    try:
+        subprocess.check_output(
+            ["git", "-C", str(repo), "checkout", base_branch],
+            stderr=subprocess.STDOUT, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return False, f"checkout {base_branch} failed: {exc.output.strip()}"
+
+    merge_cmd = ["git", "-C", str(repo), "merge"]
+    if strategy == "squash":
+        merge_cmd.append("--squash")
+    merge_cmd.append(branch)
+
+    try:
+        out = subprocess.check_output(merge_cmd, stderr=subprocess.STDOUT, text=True)
+        # For squash merges, we need an explicit commit
+        if strategy == "squash":
+            try:
+                subprocess.check_output(
+                    ["git", "-C", str(repo), "commit", "--no-edit",
+                     "-m", f"Squash merge branch '{branch}'"],
+                    stderr=subprocess.STDOUT, text=True,
+                )
+            except subprocess.CalledProcessError:
+                pass  # empty squash (no changes) is fine
+        return True, out.strip()
+    except subprocess.CalledProcessError as exc:
+        detail = exc.output.strip()
+        # Abort the failed merge
+        try:
+            subprocess.check_output(
+                ["git", "-C", str(repo), "merge", "--abort"],
+                stderr=subprocess.DEVNULL, text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        return False, f"merge conflict: {detail}"
+
+
+def _should_use_worktree(
+    config: Dict[str, Any],
+    project_data: Optional[Dict[str, Any]],
+    cli_override: Optional[bool],
+) -> bool:
+    """Evaluate whether to use a git worktree.
+
+    Priority: CLI flag > project config > global config > False.
+    """
+    if cli_override is not None:
+        return cli_override
+    if project_data and "worktrees_enabled" in project_data:
+        return bool(project_data["worktrees_enabled"])
+    return bool(config.get("worktrees_enabled", False))
+
+
 def cmd_on_finish(args: argparse.Namespace) -> int:
     home = _default_home()
     p = _ensure_init(home)
@@ -716,8 +918,12 @@ def cmd_on_finish(args: argparse.Namespace) -> int:
     else:
         meta["last_message_raw"] = raw
 
-    proj_dir = Path(meta.get("project_dir", "")).expanduser()
-    diff_stat = _git_diff_stat(proj_dir) if proj_dir else None
+    # Use worktree path for diff if available, otherwise original project dir
+    if meta.get("worktree_path"):
+        diff_target = Path(meta["worktree_path"])
+    else:
+        diff_target = Path(meta.get("project_dir", "")).expanduser()
+    diff_stat = _git_diff_stat(diff_target) if diff_target else None
     if diff_stat is not None:
         meta["git_diff_stat"] = diff_stat
 
@@ -742,6 +948,111 @@ def cmd_on_finish(args: argparse.Namespace) -> int:
         msg = f"[AI_ORCH DONE run_id={run_id} goal_met={goal_met} exit={meta.get('exit_code')}]"
         _tmux_send_keys(sendkeys_target, msg, enter=True)
 
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    """Merge a worktree branch back into its base branch."""
+    home = _default_home()
+    p = _ensure_init(home)
+    run_dir = p["runs"] / args.run_id
+    meta_path = run_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"❌ unknown run_id: {args.run_id}", file=sys.stderr)
+        return 2
+
+    meta = _load_json(meta_path, {})
+    if not meta.get("worktree_enabled"):
+        print(f"❌ run {args.run_id} was not a worktree run", file=sys.stderr)
+        return 2
+
+    branch = meta.get("worktree_branch")
+    base_branch = meta.get("base_branch")
+    original_dir = meta.get("original_project_dir")
+    if not branch or not base_branch or not original_dir:
+        print("❌ missing worktree metadata (branch, base_branch, or original_project_dir)", file=sys.stderr)
+        return 2
+
+    repo = Path(original_dir)
+    strategy = getattr(args, "strategy", "merge")
+    print(f"Merging {branch} into {base_branch} ({strategy}) in {repo}...")
+
+    success, message = _merge_worktree_branch(repo, branch, base_branch, strategy=strategy)
+    if success:
+        print(f"✅ {message}")
+        return 0
+    else:
+        print(f"❌ {message}", file=sys.stderr)
+        return 1
+
+
+def cmd_worktree_cleanup(args: argparse.Namespace) -> int:
+    """Remove worktree directories and branches for finished runs."""
+    home = _default_home()
+    p = _ensure_init(home)
+    runs_dir = p["runs"]
+
+    run_ids: list[str] = []
+    if args.run_id:
+        run_ids = [args.run_id]
+    else:
+        # Clean all finished worktree runs
+        for d in runs_dir.iterdir():
+            if not d.is_dir():
+                continue
+            meta = _load_json(d / "meta.json", {})
+            if (
+                meta.get("worktree_enabled")
+                and not meta.get("worktree_cleaned")
+                and meta.get("status") == "finished"
+            ):
+                run_ids.append(d.name)
+
+    if not run_ids:
+        print("No worktree runs to clean up.")
+        return 0
+
+    cleaned = 0
+    for rid in run_ids:
+        run_dir = runs_dir / rid
+        meta_path = run_dir / "meta.json"
+        if not meta_path.exists():
+            print(f"⚠️  unknown run_id: {rid}", file=sys.stderr)
+            continue
+
+        meta = _load_json(meta_path, {})
+        if not meta.get("worktree_enabled"):
+            print(f"⚠️  {rid}: not a worktree run, skipping", file=sys.stderr)
+            continue
+
+        wt_path = Path(meta.get("worktree_path", ""))
+        branch = meta.get("worktree_branch", "")
+        original_dir = meta.get("original_project_dir", "")
+        keep_branch = getattr(args, "keep_branch", False)
+
+        if wt_path and wt_path.exists() and original_dir:
+            repo = Path(original_dir)
+            _remove_worktree(repo, wt_path, "" if keep_branch else branch, force=args.force)
+            print(f"✅ {rid}: removed worktree {wt_path}")
+        elif wt_path and not wt_path.exists():
+            # Worktree dir already gone; still try to delete branch
+            if branch and original_dir and not keep_branch:
+                repo = Path(original_dir)
+                flag = "-D" if args.force else "-d"
+                try:
+                    subprocess.check_output(
+                        ["git", "-C", str(repo), "branch", flag, branch],
+                        stderr=subprocess.DEVNULL, text=True,
+                    )
+                except (OSError, subprocess.CalledProcessError):
+                    pass
+            print(f"✅ {rid}: worktree already removed")
+
+        meta["worktree_cleaned"] = True
+        _save_json(meta_path, meta)
+        cleaned += 1
+
+    print(f"Cleaned {cleaned} worktree run(s).")
     return 0
 
 
@@ -816,6 +1127,70 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def cmd_aggregate(args: argparse.Namespace) -> int:
+    """Poll team task files until all completed/failed or timeout, output aggregated JSON."""
+    team = args.team
+    tasks_dir = Path.home() / ".claude" / "tasks" / team
+    timeout = args.timeout
+    interval = args.interval
+
+    if not tasks_dir.exists():
+        print(json.dumps({"error": f"Tasks directory not found: {tasks_dir}"}))
+        return 2
+
+    start_time = time.monotonic()
+    while True:
+        task_files = sorted(tasks_dir.glob("*.json"))
+        # Skip lock files and result files
+        task_files = [f for f in task_files if not f.name.endswith(".lock") and not f.name.endswith("_result.json")]
+
+        if not task_files:
+            if timeout > 0 and (time.monotonic() - start_time) > timeout:
+                print(json.dumps({"team": team, "tasks": [], "overall_goal_met": False, "error": "timeout with no tasks"}))
+                return 1
+            time.sleep(interval)
+            continue
+
+        tasks = []
+        all_done = True
+        for fpath in task_files:
+            task = _load_json(fpath, None)
+            if not isinstance(task, dict):
+                continue
+            status = task.get("status", "pending")
+            if status not in ("completed", "failed"):
+                all_done = False
+            tasks.append({
+                "id": task.get("id"),
+                "subject": task.get("subject"),
+                "status": status,
+                "goal_met": status == "completed",
+            })
+
+        if all_done and tasks:
+            overall = all(t["goal_met"] for t in tasks)
+            result = {
+                "team": team,
+                "tasks": tasks,
+                "overall_goal_met": overall,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if overall else 1
+
+        if timeout > 0 and (time.monotonic() - start_time) > timeout:
+            overall = all(t["goal_met"] for t in tasks)
+            result = {
+                "team": team,
+                "tasks": tasks,
+                "overall_goal_met": False,
+                "error": "timeout",
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1
+
+        time.sleep(interval)
+
+
 def cmd_tail(args: argparse.Namespace) -> int:
     home = _default_home()
     p = _ensure_init(home)
@@ -853,6 +1228,10 @@ def _add_common_exec_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--skip-git-repo-check", action="store_true", help="Allow running outside a Git repo (unsafe).")
     sp.add_argument("--headless", action="store_true", default=False, help="Use codex exec (no UI). NOT recommended — agents run with full TUI by default.")
     sp.add_argument("--watch", action="store_false", dest="headless", help="Use interactive codex with full TUI (default).")
+    sp.add_argument("--worktree", action="store_true", default=None, dest="worktree", help="Force git worktree isolation for this run.")
+    sp.add_argument("--no-worktree", action="store_false", dest="worktree", help="Disable git worktree even if enabled in config.")
+    sp.add_argument("--no-pane", action="store_true", default=False, help="Run as detached subprocess instead of tmux pane (for headless mode).")
+    sp.add_argument("--tmux-window", default=None, help="tmux window index.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -897,8 +1276,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--timeout", type=float, default=0, help="Max wait time in seconds. 0 = no limit. Default: 0.")
     sp.set_defaults(func=cmd_wait)
 
+    sp = sub.add_parser("merge", help="Merge a worktree branch back into its base branch.")
+    sp.add_argument("run_id", help="Run id of the worktree run to merge.")
+    sp.add_argument("--strategy", choices=["merge", "squash"], default="merge",
+                    help="Merge strategy: merge (default) or squash.")
+    sp.set_defaults(func=cmd_merge)
+
+    sp = sub.add_parser("worktree-cleanup", help="Remove worktree directories and branches for finished runs.")
+    sp.add_argument("run_id", nargs="?", default=None, help="Specific run id to clean up (default: all finished).")
+    sp.add_argument("--force", action="store_true", help="Force-remove even with uncommitted changes.")
+    sp.add_argument("--keep-branch", action="store_true", help="Keep the worktree branch after removing the directory.")
+    sp.set_defaults(func=cmd_worktree_cleanup)
+
     sp = sub.add_parser("tail", help="Tail orchestrator notifications (like tail -f).")
     sp.set_defaults(func=cmd_tail)
+
+    sp = sub.add_parser("aggregate", help="Wait for all team tasks to complete, output aggregated JSON.")
+    sp.add_argument("--team", required=True, help="Team name to aggregate results for.")
+    sp.add_argument("--timeout", type=float, default=3600, help="Max seconds to wait (default: 3600).")
+    sp.add_argument("--interval", type=float, default=5, help="Poll interval in seconds (default: 5).")
+    sp.set_defaults(func=cmd_aggregate)
 
     return p
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-codex-bridge: Codex CLI as a Claude Code team member.
+claude-bridge: Claude Code CLI as a Claude Code team member.
 
 Registers as a member in a Claude Code agent team (file-based protocol)
-and translates assigned tasks into Codex CLI runs via agentctl.
+and translates assigned tasks into Claude Code CLI runs.
 
 Usage:
-    codex-bridge join  --team <name> --name codex-worker --project <proj> [options]
-    codex-bridge leave --team <name> --name codex-worker
+    claude-bridge join  --team <name> --name claude-worker --project <path> [options]
+    claude-bridge leave --team <name> --name claude-worker
 
 No external dependencies. Python 3.9+.
 """
@@ -34,15 +34,9 @@ CLAUDE_HOME = Path.home() / ".claude"
 TEAMS_DIR = CLAUDE_HOME / "teams"
 TASKS_DIR = CLAUDE_HOME / "tasks"
 
-AGENTCTL = Path(__file__).resolve().parent / "agentctl"
-if not AGENTCTL.exists():
-    raise FileNotFoundError(f"agentctl not found at {AGENTCTL}")
-
-ORCH_HOME = AGENTCTL.parent.parent / ".ai-orch"
-
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_TASK_TIMEOUT = 600
-DEFAULT_PROFILE = "spark"
+DEFAULT_MODEL = None  # use claude's default
 
 DEEP_KEYWORDS = frozenset({
     "refactor", "plan", "complex", "architect", "redesign",
@@ -149,25 +143,22 @@ def register(team: str, name: str, project_dir: str) -> None:
     with FileLock(cfg_path):
         config = _read_json(cfg_path, {})
         members: list = config.setdefault("members", [])
-        # Remove stale entry with same name
         config["members"] = [m for m in members if m.get("name") != name]
         config["members"].append({
             "agentId": f"{name}@{team}",
             "name": name,
-            "agentType": "codex-bridge",
-            "model": "codex-cli",
-            "color": "green",
+            "agentType": "claude-bridge",
+            "model": "claude-code",
+            "color": "blue",
             "joinedAt": _now_ms(),
-            "tmuxPaneId": "",
             "cwd": project_dir,
             "subscriptions": [],
-            "backendType": "codex-bridge",
+            "backendType": "claude-bridge",
             "isActive": True,
             "mode": "default",
         })
         _write_json_atomic(cfg_path, config)
 
-    # Ensure inbox file exists
     ib = _inbox_path(team, name)
     if not ib.exists():
         _write_json_atomic(ib, [])
@@ -190,7 +181,6 @@ def _find_leader(team: str, my_name: str) -> Optional[str]:
     for m in config.get("members", []):
         if m.get("name") != my_name and m.get("isActive", True):
             return m["name"]
-    # Fallback: any member that isn't us
     for m in config.get("members", []):
         if m.get("name") != my_name:
             return m["name"]
@@ -245,7 +235,6 @@ def _scan_pending_tasks(team: str, owner: str) -> List[Dict[str, Any]]:
         if task.get("status") != "pending":
             continue
 
-        # Check blockers
         blocked_by = task.get("blockedBy", [])
         if blocked_by:
             all_resolved = True
@@ -276,16 +265,20 @@ def _update_task(team: str, task_id: str, updates: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Profile selection heuristic
+# Model selection heuristic
 # ---------------------------------------------------------------------------
 
-def _select_profile(subject: str, description: str, default: str) -> str:
-    """Return 'deep' if the task text contains complexity keywords, else *default*."""
+def _select_model(subject: str, description: str, default_model: Optional[str]) -> Optional[str]:
+    """Return a specific model for complex tasks, else *default_model*.
+
+    For complex tasks (detected by keywords), we use opus.
+    For simple tasks, we use the default (None = claude's default, usually sonnet).
+    """
     text = f"{subject} {description}".lower()
     for kw in DEEP_KEYWORDS:
         if kw in text:
-            return "deep"
-    return default
+            return "claude-opus-4-6"
+    return default_model
 
 
 # ---------------------------------------------------------------------------
@@ -300,121 +293,106 @@ def _build_prompt(subject: str, description: str, inbox_context: str = "") -> st
         parts.append(f"\n## Additional Context\n{inbox_context}")
     parts.append(
         "\n# Output (STRICT)\n"
-        "Return ONLY JSON: {goal_met: bool, summary: string, "
-        "followup_prompt: string, notes: string}"
+        "When you are completely finished, output ONLY a JSON object on its last line:\n"
+        '{"goal_met": true/false, "summary": "what you did"}\n'
+        "This must be the very last thing you output."
     )
     return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Codex execution via agentctl
+# Claude execution
 # ---------------------------------------------------------------------------
 
-def _run_codex_task(
-    project: str,
-    profile: str,
+def _extract_structured_result(stdout: str) -> Dict[str, Any]:
+    """Try to extract {goal_met, summary} JSON from Claude's output."""
+    # Try parsing the entire output as JSON first
+    try:
+        parsed = json.loads(stdout.strip())
+        if isinstance(parsed, dict) and "goal_met" in parsed:
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try to find JSON in the output (last JSON object wins)
+    result = None
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict) and "goal_met" in parsed:
+                    result = parsed
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    if result:
+        return result
+
+    # Try to extract from --output-format json response
+    try:
+        parsed = json.loads(stdout.strip())
+        if isinstance(parsed, dict):
+            # Claude --output-format json wraps in {"result": "..."}
+            text = parsed.get("result", "") or parsed.get("text", "") or str(parsed)
+            for line in reversed(text.strip().splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        inner = json.loads(line)
+                        if isinstance(inner, dict) and "goal_met" in inner:
+                            return inner
+                    except json.JSONDecodeError:
+                        continue
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fallback: couldn't extract structured result
+    return {
+        "goal_met": False,
+        "summary": f"Could not extract structured result. Raw output (last 500 chars): {stdout[-500:]}",
+    }
+
+
+def _run_claude_task(
+    project_dir: str,
     prompt: str,
     timeout: int,
-    tmux_session: Optional[str] = None,
-    use_worktree: Optional[bool] = None,
-    no_tmux: bool = False,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Start a Codex run via ``agentctl start`` and block on ``agentctl wait``."""
+    """Run a Claude Code task via `claude -p` and return structured result."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if model:
+        cmd.extend(["--model", model])
 
-    # --- agentctl start ---
     try:
-        cmd = [
-            sys.executable, str(AGENTCTL),
-            "start", "--project", project, "--profile", profile,
-            "--prompt-file", "-",
-        ]
-        if no_tmux:
-            cmd.append("--no-pane")
-        elif tmux_session:
-            cmd.extend(["--tmux-session", tmux_session])
-        if use_worktree is True:
-            cmd.append("--worktree")
-        elif use_worktree is False:
-            cmd.append("--no-worktree")
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            cwd=project_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         try:
-            stdout, stderr = proc.communicate(input=prompt, timeout=30)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            return {"goal_met": False, "summary": "agentctl start timed out (30s)"}
-        if proc.returncode != 0:
-            return {
-                "goal_met": False,
-                "summary": f"agentctl start failed (rc={proc.returncode}): "
-                           f"{stderr.strip()[:300]}",
-            }
-        run_id = stdout.strip()
-        if not run_id:
-            return {"goal_met": False, "summary": "agentctl start returned empty run_id"}
-    except Exception as exc:
-        return {"goal_met": False, "summary": f"agentctl start error: {exc}"}
+            return {"goal_met": False, "summary": f"claude -p timed out after {timeout}s"}
 
-    # --- agentctl wait ---
-    try:
-        proc = subprocess.Popen(
-            [
-                sys.executable, str(AGENTCTL),
-                "wait", run_id, "--timeout", str(timeout),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout + 60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        if proc.returncode != 0 and not stdout.strip():
             return {
                 "goal_met": False,
-                "summary": f"agentctl wait timed out after {timeout}s",
-                "run_id": run_id,
+                "summary": f"claude -p failed (rc={proc.returncode}): {stderr.strip()[:300]}",
             }
-        stdout = stdout.strip()
-        if proc.returncode != 0 and not stdout:
-            return {
-                "goal_met": False,
-                "summary": f"agentctl wait failed: {stderr.strip()[:300]}",
-                "run_id": run_id,
-            }
-        try:
-            meta = json.loads(stdout)
-        except json.JSONDecodeError:
-            return {
-                "goal_met": False,
-                "summary": "agentctl wait returned invalid JSON",
-                "run_id": run_id,
-                "raw_output": stdout[:500],
-            }
-        result_dict: Dict[str, Any] = {
-            "goal_met": meta.get("goal_met", False),
-            "summary": meta.get("summary", "No summary"),
-            "run_id": run_id,
-            "exit_code": meta.get("exit_code"),
-            "git_diff_stat": meta.get("git_diff_stat", ""),
-            "profile": meta.get("profile"),
-        }
-        if meta.get("worktree_branch"):
-            result_dict["worktree_branch"] = meta["worktree_branch"]
-        return result_dict
+
+        return _extract_structured_result(stdout)
+
+    except FileNotFoundError:
+        return {"goal_met": False, "summary": "claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"}
     except Exception as exc:
-        return {
-            "goal_met": False,
-            "summary": f"agentctl wait error: {exc}",
-            "run_id": run_id,
-        }
+        return {"goal_met": False, "summary": f"claude -p error: {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -429,12 +407,9 @@ def _report_result(
     result: Dict[str, Any],
 ) -> None:
     """Update the task status and post a summary to the leader's inbox."""
-
     goal_met = result.get("goal_met", False)
     summary = result.get("summary", "No summary")
-    git_info = result.get("git_diff_stat", "")
 
-    # Update task status
     if goal_met:
         _update_task(team, task_id, {"status": "completed"})
     else:
@@ -444,18 +419,9 @@ def _report_result(
             "failed_at": _now_iso(),
         })
 
-    # Build inbox message
     tag = "COMPLETED" if goal_met else "FAILED"
-    text_lines = [f"[codex-bridge] Task #{task_id} {tag}"]
+    text_lines = [f"[claude-bridge] Task #{task_id} {tag}"]
     text_lines.append(f"Summary: {summary}")
-    if git_info:
-        text_lines.append(f"Git: {git_info}")
-    wt_branch = result.get("worktree_branch")
-    if wt_branch:
-        text_lines.append(f"Worktree branch: {wt_branch}")
-    run_id = result.get("run_id")
-    if run_id:
-        text_lines.append(f"Run: {run_id}")
 
     short_summary = summary[:60]
     msg = {
@@ -464,7 +430,7 @@ def _report_result(
         "summary": f"Task #{task_id} {'done' if goal_met else 'failed'}: {short_summary}",
         "timestamp": _now_iso(),
         "read": False,
-        "color": "green",
+        "color": "blue",
     }
 
     leader = _find_leader(team, my_name)
@@ -481,20 +447,14 @@ def _report_result(
 # ---------------------------------------------------------------------------
 
 def _is_shutdown_request(msg: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Check if an inbox message is a shutdown request.
-
-    Returns (is_shutdown, request_id).
-    """
+    """Check if an inbox message is a shutdown request."""
     text = msg.get("text", "")
-
-    # Require explicit JSON protocol message only
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and parsed.get("type") == "shutdown_request":
             return True, parsed.get("requestId") or parsed.get("request_id")
     except (json.JSONDecodeError, TypeError):
         pass
-
     return False, None
 
 
@@ -504,65 +464,26 @@ def _is_shutdown_request(msg: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
 def _log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[codex-bridge {ts}] {msg}", flush=True)
+    print(f"[claude-bridge {ts}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
-def _load_orch_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Load global config and projects from .ai-orch."""
-    config_path = ORCH_HOME / "config.json"
-    projects_path = ORCH_HOME / "projects.json"
-    config = _read_json(config_path, {})
-    projects_data = _read_json(projects_path, {"projects": {}})
-    return config, projects_data
-
-
-def _resolve_worktree_setting(
-    orch_config: Dict[str, Any],
-    projects_data: Dict[str, Any],
-    project: str,
-) -> Optional[bool]:
-    """Evaluate worktree config for a project.
-
-    Returns True/False if configured, None if not set anywhere.
-    """
-    # Check per-project override
-    proj = projects_data.get("projects", {}).get(project, {})
-    if isinstance(proj, dict) and "worktrees_enabled" in proj:
-        return bool(proj["worktrees_enabled"])
-    # Check global config
-    if "worktrees_enabled" in orch_config:
-        return bool(orch_config["worktrees_enabled"])
-    return None
-
-
 def _main_loop(
     team: str,
     name: str,
-    project: str,
-    profile: str,
+    project_dir: str,
+    model: Optional[str],
     poll_interval: float,
     task_timeout: int,
-    tmux_session: Optional[str] = None,
-    no_tmux: bool = False,
 ) -> None:
-    _log(f"Started  team={team}  name={name}  project={project}  profile={profile}")
+    _log(f"Started  team={team}  name={name}  project={project_dir}  model={model or 'default'}")
     _log(f"Poll every {poll_interval}s, task timeout {task_timeout}s")
     _log(f"Config   {_config_path(team)}")
     _log(f"Inbox    {_inbox_path(team, name)}")
     _log(f"Tasks    {_tasks_dir(team)}/")
-
-    # Load worktree configuration once at startup
-    orch_config, projects_data = _load_orch_config()
-    use_worktree = _resolve_worktree_setting(orch_config, projects_data, project)
-    if use_worktree:
-        _log("Worktrees: enabled")
-    else:
-        _log("Worktrees: disabled")
-
     _log("Waiting for tasks...")
 
     running = True
@@ -588,7 +509,6 @@ def _main_loop(
                     deregister(team, name)
                     return
 
-                # Collect context for the next task prompt
                 sender = msg.get("from", "unknown")
                 inbox_context_parts.append(
                     f"[Message from {sender}]: {msg.get('text', '')}"
@@ -646,20 +566,18 @@ def _main_loop(
                 "started_at": _now_iso(),
             })
 
-            # ---- 5. Build prompt & select profile ----
-            effective_profile = _select_profile(subject, description, profile)
+            # ---- 5. Build prompt & select model ----
+            effective_model = _select_model(subject, description, model)
             prompt = _build_prompt(subject, description, inbox_context)
 
-            _log(f"    profile={effective_profile}")
+            _log(f"    model={effective_model or 'default'}")
 
-            # ---- 6. Run Codex via agentctl ----
-            result = _run_codex_task(project, effective_profile, prompt, task_timeout,
-                                     tmux_session=tmux_session,
-                                     use_worktree=use_worktree,
-                                     no_tmux=no_tmux)
+            # ---- 6. Run Claude ----
+            result = _run_claude_task(project_dir, prompt, task_timeout,
+                                      model=effective_model)
 
             goal = result.get("goal_met")
-            _log(f"    result: goal_met={goal}  run_id={result.get('run_id', '?')}")
+            _log(f"    result: goal_met={goal}")
 
             # ---- 7. Report result ----
             _report_result(team, name, task_id, subject, result)
@@ -679,40 +597,36 @@ def _main_loop(
 # ---------------------------------------------------------------------------
 
 def _wait_for_team(team: str, poll_interval: float) -> None:
-    """Block until the team config file exists (created by TeamCreate)."""
+    """Block until the team config file exists."""
     cfg = _config_path(team)
     while not cfg.exists():
         _log(f"Waiting for team '{team}' to be created...")
         time.sleep(poll_interval)
-    time.sleep(1)  # let TeamCreate finish writing
+    time.sleep(1)
     _log(f"Team '{team}' detected")
 
 
 def cmd_join(args: argparse.Namespace) -> int:
     team: str = args.team
     name: str = args.name
-    project: str = args.project
+    project_dir: str = args.project
 
-    # Resolve project directory for registration metadata
-    proj_path = Path(project).expanduser().resolve()
+    proj_path = Path(project_dir).expanduser().resolve()
     cwd = str(proj_path) if proj_path.is_dir() else os.getcwd()
 
-    # Wait for team to exist (supports --bridge mode where team is created later)
     _wait_for_team(team, args.poll_interval)
 
     _log(f"Joining team={team} as name={name}")
     register(team, name, cwd)
-    _log("Registered ✓")
+    _log("Registered")
 
     _main_loop(
         team=team,
         name=name,
-        project=project,
-        profile=args.profile,
+        project_dir=cwd,
+        model=args.model,
         poll_interval=args.poll_interval,
         task_timeout=args.task_timeout,
-        tmux_session=getattr(args, "tmux_session", None),
-        no_tmux=getattr(args, "no_tmux", False),
     )
     return 0
 
@@ -723,7 +637,7 @@ def cmd_leave(args: argparse.Namespace) -> int:
 
     _log(f"Leaving team={team} as name={name}")
     deregister(team, name)
-    _log("Deregistered (isActive=false) ✓")
+    _log("Deregistered (isActive=false)")
     return 0
 
 
@@ -733,42 +647,36 @@ def cmd_leave(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="codex-bridge",
-        description="Codex CLI as a Claude Code team member. "
-                    "Polls the team task list and executes tasks via agentctl.",
+        prog="claude-bridge",
+        description="Claude Code CLI as a Claude Code team member. "
+                    "Polls the team task list and executes tasks via claude -p.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # -- join --
     sp = sub.add_parser(
         "join",
         help="Join a Claude Code team and start processing tasks.",
     )
-    sp.add_argument("--team", required=True, help="Team name (must already exist)")
-    sp.add_argument("--name", default="codex-worker",
-                    help="Worker name in team (default: codex-worker)")
+    sp.add_argument("--team", required=True, help="Team name")
+    sp.add_argument("--name", default="claude-worker",
+                    help="Worker name in team (default: claude-worker)")
     sp.add_argument("--project", required=True,
-                    help="Project name (registered in agentctl) or filesystem path")
-    sp.add_argument("--profile", default=DEFAULT_PROFILE,
-                    help=f"Default Codex profile (default: {DEFAULT_PROFILE})")
+                    help="Project directory path")
+    sp.add_argument("--model", default=DEFAULT_MODEL,
+                    help="Default Claude model (default: claude's default)")
     sp.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help=f"Seconds between polls (default: {DEFAULT_POLL_INTERVAL})")
     sp.add_argument("--task-timeout", type=int, default=DEFAULT_TASK_TIMEOUT,
                     help=f"Max seconds per task (default: {DEFAULT_TASK_TIMEOUT})")
-    sp.add_argument("--tmux-session", default=None,
-                    help="tmux session for Codex panes (default: auto-detect)")
-    sp.add_argument("--no-tmux", action="store_true", default=False,
-                    help="Run without tmux (passes --no-pane to agentctl)")
     sp.set_defaults(func=cmd_join)
 
-    # -- leave --
     sp = sub.add_parser(
         "leave",
         help="Gracefully leave a team (sets isActive=false).",
     )
     sp.add_argument("--team", required=True, help="Team name")
-    sp.add_argument("--name", default="codex-worker",
-                    help="Worker name (default: codex-worker)")
+    sp.add_argument("--name", default="claude-worker",
+                    help="Worker name (default: claude-worker)")
     sp.set_defaults(func=cmd_leave)
 
     return p

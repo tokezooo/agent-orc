@@ -1,22 +1,114 @@
 #!/usr/bin/env bash
-# Launch Claude Code as the orchestrator for the current directory.
+# Launch an orchestrator session for the current directory.
 #
 # Usage:
-#   orch                    # orchestrate in cwd
-#   orch /path/to/repo      # orchestrate in a specific repo
-#   orch -c                 # continue last orchestrator session
-#   orch --bridge           # auto-start codex-bridge in a tmux pane
+#   orch                                    # Claude orchestrator, interactive
+#   orch /path/to/repo                      # orchestrate in a specific repo
+#   orch --bridge                           # Claude orchestrator + Codex worker bridge
+#   orch --engine codex                     # Codex orchestrator (interactive TUI)
+#   orch --bridge --bridge-engine claude    # Claude orchestrator + Claude worker bridge
+#   orch --headless -p "Fix bugs"           # headless: no UI, no tmux, JSON output
+#   orch -c                                 # continue last session
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ORCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 AGENTCTL="$SCRIPT_DIR/agentctl"
-BRIDGE="$SCRIPT_DIR/codex-bridge"
-PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator.md"
+CODEX_BRIDGE="$SCRIPT_DIR/codex-bridge"
+CLAUDE_BRIDGE="$SCRIPT_DIR/claude-bridge"
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+ENGINE="claude"
+BRIDGE_MODE=false
+BRIDGE_ENGINE="codex"
+HEADLESS=false
+PROMPT=""
+TIMEOUT=3600
+TARGET_DIR=""
+EXTRA_ARGS=()
+
+# ---------------------------------------------------------------------------
+# Parse arguments (while/shift for proper flag-with-value handling)
+# ---------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --engine)
+            ENGINE="$2"; shift 2 ;;
+        --engine=*)
+            ENGINE="${1#*=}"; shift ;;
+        --bridge)
+            BRIDGE_MODE=true; shift ;;
+        --bridge-engine)
+            BRIDGE_ENGINE="$2"; shift 2 ;;
+        --bridge-engine=*)
+            BRIDGE_ENGINE="${1#*=}"; shift ;;
+        --headless)
+            HEADLESS=true; shift ;;
+        -p|--prompt)
+            PROMPT="$2"; shift 2 ;;
+        --prompt=*)
+            PROMPT="${1#*=}"; shift ;;
+        --timeout)
+            TIMEOUT="$2"; shift 2 ;;
+        --timeout=*)
+            TIMEOUT="${1#*=}"; shift ;;
+        -c|--continue|-r|--resume)
+            EXTRA_ARGS+=("$1"); shift ;;
+        -*)
+            EXTRA_ARGS+=("$1"); shift ;;
+        *)
+            if [ -z "$TARGET_DIR" ] && [ -d "$1" ]; then
+                TARGET_DIR="$1"
+            else
+                EXTRA_ARGS+=("$1")
+            fi
+            shift ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Validate
+# ---------------------------------------------------------------------------
+if [ "$ENGINE" != "claude" ] && [ "$ENGINE" != "codex" ]; then
+    echo "Error: --engine must be 'claude' or 'codex' (got '$ENGINE')" >&2
+    exit 1
+fi
+if [ "$BRIDGE_ENGINE" != "codex" ] && [ "$BRIDGE_ENGINE" != "claude" ]; then
+    echo "Error: --bridge-engine must be 'codex' or 'claude' (got '$BRIDGE_ENGINE')" >&2
+    exit 1
+fi
+if [ "$HEADLESS" = true ] && [ -z "$PROMPT" ]; then
+    echo "Error: --headless requires -p/--prompt" >&2
+    exit 1
+fi
+
+# cd to target directory if specified
+if [ -n "$TARGET_DIR" ]; then
+    cd "$TARGET_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve prompt file and bridge script
+# ---------------------------------------------------------------------------
+if [ "$ENGINE" = "claude" ]; then
+    PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator.md"
+else
+    PROMPT_FILE="$ORCH_ROOT/prompts/orchestrator-codex.md"
+fi
 
 if [ ! -f "$PROMPT_FILE" ]; then
     echo "Error: orchestrator prompt not found at $PROMPT_FILE" >&2
     exit 1
+fi
+
+if [ "$BRIDGE_ENGINE" = "codex" ]; then
+    BRIDGE_SCRIPT="$CODEX_BRIDGE"
+    WORKER_NAME="codex-worker"
+else
+    BRIDGE_SCRIPT="$CLAUDE_BRIDGE"
+    WORKER_NAME="claude-worker"
 fi
 
 # Build the system prompt with context
@@ -27,94 +119,223 @@ agentctl location: $AGENTCTL
 Prompt templates: $ORCH_ROOT/prompts/
 To run agentctl: python3 $AGENTCTL <command> [args...]"
 
-# Parse args
-TARGET_DIR=""
-BRIDGE_MODE=false
-EXTRA_ARGS=()
+# Generate a unique team name (used in bridge and headless modes)
+TEAM="orch-$(head -c 8 /dev/urandom | xxd -p | head -c 8)"
 
-for arg in "$@"; do
-    case "$arg" in
-        --bridge)
-            BRIDGE_MODE=true
-            ;;
-        -c|--continue|-r|--resume)
-            EXTRA_ARGS+=("$arg")
-            ;;
-        -*)
-            EXTRA_ARGS+=("$arg")
-            ;;
-        *)
-            if [ -z "$TARGET_DIR" ] && [ -d "$arg" ]; then
-                TARGET_DIR="$arg"
-            else
-                EXTRA_ARGS+=("$arg")
-            fi
-            ;;
-    esac
-done
+PROJECT_DIR="$(pwd)"
 
-# cd to target directory if specified
-if [ -n "$TARGET_DIR" ]; then
-    cd "$TARGET_DIR"
-fi
+# Track bridge subprocess/pane for cleanup
+BRIDGE_PID=""
+BRIDGE_PANE=""
 
-if [ "$BRIDGE_MODE" = true ]; then
-    # Generate a unique team name
-    TEAM="orch-$(head -c 8 /dev/urandom | xxd -p | head -c 8)"
+cleanup() {
+    if [ -n "$BRIDGE_PID" ]; then
+        echo "Shutting down bridge (pid=$BRIDGE_PID)..."
+        kill "$BRIDGE_PID" 2>/dev/null || true
+        wait "$BRIDGE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$BRIDGE_PANE" ]; then
+        tmux kill-pane -t "$BRIDGE_PANE" 2>/dev/null || true
+    fi
+    # Deregister bridge worker
+    if [ "$BRIDGE_MODE" = true ] || [ "$HEADLESS" = true ]; then
+        python3 "$BRIDGE_SCRIPT" leave --team "$TEAM" --name "$WORKER_NAME" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
-    # Verify we're inside tmux
-    if [ -z "${TMUX:-}" ]; then
-        echo "Error: --bridge requires running inside a tmux session" >&2
-        echo "Start one with: tmux new -s ai" >&2
-        exit 1
+# ===================================================================
+# HEADLESS MODE
+# ===================================================================
+if [ "$HEADLESS" = true ]; then
+
+    # Always start bridge in headless mode (as background subprocess)
+    if [ "$BRIDGE_MODE" = true ] || true; then
+        BRIDGE_ARGS=(join --team "$TEAM" --name "$WORKER_NAME" --project "$PROJECT_DIR")
+        if [ "$BRIDGE_ENGINE" = "codex" ]; then
+            BRIDGE_ARGS+=(--no-tmux)
+        fi
+        python3 "$BRIDGE_SCRIPT" "${BRIDGE_ARGS[@]}" &
+        BRIDGE_PID=$!
     fi
 
-    # Capture the current tmux session so the bridge spawns Codex panes here
-    TMUX_SESSION="$(tmux display-message -p '#S')"
+    if [ "$ENGINE" = "claude" ]; then
+        # Claude headless: use claude -p with system prompt
+        claude -p "$PROMPT" --output-format json --append-system-prompt "$SYSTEM_PROMPT
 
-    # Capture project dir safely to avoid command injection in tmux command
-    PROJECT_DIR="$(pwd)"
-    ESCAPED_PROJECT_DIR="$(printf '%q' "$PROJECT_DIR")"
+## Active Bridge (headless mode)
+A $BRIDGE_ENGINE-bridge daemon is running as a background process.
 
-    # Spawn codex-bridge in a right-side tmux pane (waits for team to appear)
-    BRIDGE_PANE="$(tmux split-window -h -d -P -F '#{pane_id}' \
-        "python3 '$BRIDGE' join --team '$TEAM' --name codex-worker --project $ESCAPED_PROJECT_DIR --tmux-session '$TMUX_SESSION'")"
-
-    # Append bridge instructions to the system prompt
-    SYSTEM_PROMPT="$SYSTEM_PROMPT
-
-## Active Codex Bridge (OVERRIDES agentctl workflow)
-IMPORTANT: A codex-bridge daemon is running in the adjacent tmux pane.
-
-Step 1 — At the very start of this session, create the team:
+Step 1 — Create the team immediately:
   TeamCreate(team_name=\"$TEAM\")
-The bridge worker 'codex-worker' will auto-join once the team exists.
+The bridge worker '$WORKER_NAME' will auto-join once the team exists.
 
-Step 2 — Assign ALL Codex work via TaskCreate:
-  TaskCreate(subject=\"...\", description=\"...\", owner=\"codex-worker\")
+Step 2 — Assign work via TaskCreate:
+  TaskCreate(subject=\"...\", description=\"...\", owner=\"$WORKER_NAME\")
 Results arrive in your inbox automatically.
 
 DO NOT use 'agentctl start' or 'agentctl wait' directly — the bridge handles execution.
 Use agentctl only for 'agentctl show <run_id>' to inspect past results if needed."
 
-    # Run claude (not exec) so we can cleanup after it exits.
-    # Pass an initial prompt so Claude creates the team immediately.
-    INIT_PROMPT="Initialize: create team $TEAM and wait for my instructions."
-    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-        claude --append-system-prompt "$SYSTEM_PROMPT" "$INIT_PROMPT"
     else
-        claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}" "$INIT_PROMPT"
+        # Codex headless: decompose via file protocol + aggregate
+        # Create team directory
+        mkdir -p "$HOME/.claude/teams/$TEAM/inboxes" "$HOME/.claude/tasks/$TEAM"
+        cat > "$HOME/.claude/teams/$TEAM/config.json" << TEAMEOF
+{"members": []}
+TEAMEOF
+
+        # Wait for bridge to register
+        sleep 3
+
+        # Use codex exec to decompose the prompt into subtasks
+        # The codex orchestrator writes task files directly
+        DECOMPOSE_PROMPT="You are a task decomposer. Break the following task into 1-5 focused subtasks.
+For each subtask, output a JSON array of objects: [{\"id\": \"1\", \"subject\": \"...\", \"description\": \"...\"}]
+Output ONLY the JSON array, no other text.
+
+TASK: $PROMPT"
+
+        SUBTASKS_JSON="$(codex exec -C "$PROJECT_DIR" --full-auto - <<< "$DECOMPOSE_PROMPT" 2>/dev/null || echo '[]')"
+
+        # Write task files
+        python3 -c "
+import json, sys
+try:
+    # Try to parse the subtasks JSON
+    text = '''$SUBTASKS_JSON'''
+    # Find JSON array in output
+    start = text.find('[')
+    end = text.rfind(']') + 1
+    if start >= 0 and end > start:
+        tasks = json.loads(text[start:end])
+    else:
+        tasks = [{'id': '1', 'subject': 'Execute task', 'description': '''$PROMPT'''}]
+
+    for t in tasks:
+        tid = str(t.get('id', '1'))
+        task_obj = {
+            'id': tid,
+            'subject': t.get('subject', 'Task'),
+            'description': t.get('description', ''),
+            'status': 'pending',
+            'owner': '$WORKER_NAME',
+            'activeForm': 'Working on task',
+            'blockedBy': [],
+            'blocks': [],
+        }
+        path = '$HOME/.claude/tasks/$TEAM/' + tid + '.json'
+        with open(path, 'w') as f:
+            json.dump(task_obj, f, indent=2)
+        print(f'Created task {tid}: {task_obj[\"subject\"]}', file=sys.stderr)
+except Exception as e:
+    # Fallback: single task
+    task_obj = {
+        'id': '1',
+        'subject': 'Execute task',
+        'description': '''$PROMPT''',
+        'status': 'pending',
+        'owner': '$WORKER_NAME',
+        'activeForm': 'Working on task',
+        'blockedBy': [],
+        'blocks': [],
+    }
+    with open('$HOME/.claude/tasks/$TEAM/1.json', 'w') as f:
+        json.dump(task_obj, f, indent=2)
+    print(f'Fallback: created single task (error: {e})', file=sys.stderr)
+"
+
+        # Wait for all tasks to complete
+        python3 "$AGENTCTL" aggregate --team "$TEAM" --timeout "$TIMEOUT"
     fi
 
-    # Cleanup: tell bridge to leave and kill its tmux pane
-    echo "Shutting down codex-bridge (team=$TEAM)..."
-    python3 "$BRIDGE" leave --team "$TEAM" --name codex-worker 2>/dev/null || true
-    tmux kill-pane -t "$BRIDGE_PANE" 2>/dev/null || true
-    exit 0
+    exit $?
 fi
 
-if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-    exec claude --append-system-prompt "$SYSTEM_PROMPT"
+# ===================================================================
+# INTERACTIVE MODE (requires tmux for bridge)
+# ===================================================================
+
+if [ "$BRIDGE_MODE" = true ]; then
+    # Verify we're inside tmux
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: --bridge in interactive mode requires running inside a tmux session" >&2
+        echo "Start one with: tmux new -s ai" >&2
+        echo "Or use --headless for tmux-free operation." >&2
+        exit 1
+    fi
+
+    TMUX_SESSION="$(tmux display-message -p '#S')"
+    ESCAPED_PROJECT_DIR="$(printf '%q' "$PROJECT_DIR")"
+
+    # Spawn bridge in a right-side tmux pane
+    BRIDGE_CMD="python3 '$BRIDGE_SCRIPT' join --team '$TEAM' --name '$WORKER_NAME' --project $ESCAPED_PROJECT_DIR"
+    if [ "$BRIDGE_ENGINE" = "codex" ]; then
+        BRIDGE_CMD="$BRIDGE_CMD --tmux-session '$TMUX_SESSION'"
+    fi
+    BRIDGE_PANE="$(tmux split-window -h -d -P -F '#{pane_id}' "$BRIDGE_CMD")"
+
+    # Append bridge instructions to the system prompt
+    SYSTEM_PROMPT="$SYSTEM_PROMPT
+
+## Active Bridge (OVERRIDES agentctl workflow)
+IMPORTANT: A $BRIDGE_ENGINE-bridge daemon is running in the adjacent tmux pane.
+
+Step 1 — At the very start of this session, create the team:
+  TeamCreate(team_name=\"$TEAM\")
+The bridge worker '$WORKER_NAME' will auto-join once the team exists.
+
+Step 2 — Assign ALL work via TaskCreate:
+  TaskCreate(subject=\"...\", description=\"...\", owner=\"$WORKER_NAME\")
+Results arrive in your inbox automatically.
+
+DO NOT use 'agentctl start' or 'agentctl wait' directly — the bridge handles execution.
+Use agentctl only for 'agentctl show <run_id>' to inspect past results if needed."
+fi
+
+# Launch orchestrator
+INIT_PROMPT=""
+if [ "$BRIDGE_MODE" = true ]; then
+    INIT_PROMPT="Initialize: create team $TEAM and wait for my instructions."
+fi
+
+if [ "$ENGINE" = "claude" ]; then
+    # Claude Code interactive
+    if [ -n "$INIT_PROMPT" ]; then
+        if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+            claude --append-system-prompt "$SYSTEM_PROMPT" "$INIT_PROMPT"
+        else
+            claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}" "$INIT_PROMPT"
+        fi
+    else
+        if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+            exec claude --append-system-prompt "$SYSTEM_PROMPT"
+        else
+            exec claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}"
+        fi
+    fi
 else
-    exec claude --append-system-prompt "$SYSTEM_PROMPT" "${EXTRA_ARGS[@]}"
+    # Codex interactive TUI
+    # Codex doesn't have --append-system-prompt, so we prepend system context to the prompt
+    if [ -n "$INIT_PROMPT" ]; then
+        CODEX_PROMPT="$INIT_PROMPT"
+    else
+        CODEX_PROMPT=""
+    fi
+
+    CODEX_ARGS=(-C "$PROJECT_DIR")
+    if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+        CODEX_ARGS+=("${EXTRA_ARGS[@]}")
+    fi
+
+    # Write system prompt to a temp file for Codex to reference
+    SYSTEM_PROMPT_FILE="$(mktemp)"
+    echo "$SYSTEM_PROMPT" > "$SYSTEM_PROMPT_FILE"
+
+    if [ -n "$CODEX_PROMPT" ]; then
+        # Prepend system context instruction
+        exec codex "${CODEX_ARGS[@]}" "Read the orchestrator instructions at $SYSTEM_PROMPT_FILE then: $CODEX_PROMPT"
+    else
+        exec codex "${CODEX_ARGS[@]}" "Read the orchestrator instructions at $SYSTEM_PROMPT_FILE and wait for user instructions."
+    fi
 fi
