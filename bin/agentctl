@@ -456,7 +456,8 @@ def _start_common(
                 'echo "[agentctl] done run=$RUN_ID exit=$EC"',
                 f'echo "[agentctl] artifacts: {str(run_dir)}"',
                 '# Auto-close pane when done',
-                'tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || exit 0',
+                'if [ -n "${TMUX_PANE:-}" ]; then tmux kill-pane -t "$TMUX_PANE" 2>/dev/null; fi',
+                'exit 0',
                 "",
             ]
         )
@@ -465,10 +466,20 @@ def _start_common(
     )
     run_sh.chmod(0o755)
 
-    tmux_session = args.tmux_session
-    # Target the orchestrator's window (default: window where orchestrator runs)
-    tmux_target = f"{tmux_session}:{args.tmux_window}" if getattr(args, "tmux_window", None) else tmux_session
-    _spawn_tmux_pane(tmux_target=tmux_target, cwd=proj_dir, script_path=run_sh)
+    if getattr(args, 'no_pane', False):
+        import subprocess as _sp
+        _sp.Popen(
+            ["bash", str(run_sh)],
+            cwd=str(proj_dir),
+            start_new_session=True,
+            stdout=open(run_dir / "stdout.log", "w"),
+            stderr=open(run_dir / "stderr_pane.log", "w"),
+        )
+    else:
+        tmux_session = args.tmux_session
+        # Target the orchestrator's window (default: window where orchestrator runs)
+        tmux_target = f"{tmux_session}:{args.tmux_window}" if getattr(args, "tmux_window", None) else tmux_session
+        _spawn_tmux_pane(tmux_target=tmux_target, cwd=proj_dir, script_path=run_sh)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -1116,6 +1127,70 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def cmd_aggregate(args: argparse.Namespace) -> int:
+    """Poll team task files until all completed/failed or timeout, output aggregated JSON."""
+    team = args.team
+    tasks_dir = Path.home() / ".claude" / "tasks" / team
+    timeout = args.timeout
+    interval = args.interval
+
+    if not tasks_dir.exists():
+        print(json.dumps({"error": f"Tasks directory not found: {tasks_dir}"}))
+        return 2
+
+    start_time = time.monotonic()
+    while True:
+        task_files = sorted(tasks_dir.glob("*.json"))
+        # Skip lock files and result files
+        task_files = [f for f in task_files if not f.name.endswith(".lock") and not f.name.endswith("_result.json")]
+
+        if not task_files:
+            if timeout > 0 and (time.monotonic() - start_time) > timeout:
+                print(json.dumps({"team": team, "tasks": [], "overall_goal_met": False, "error": "timeout with no tasks"}))
+                return 1
+            time.sleep(interval)
+            continue
+
+        tasks = []
+        all_done = True
+        for fpath in task_files:
+            task = _load_json(fpath, None)
+            if not isinstance(task, dict):
+                continue
+            status = task.get("status", "pending")
+            if status not in ("completed", "failed"):
+                all_done = False
+            tasks.append({
+                "id": task.get("id"),
+                "subject": task.get("subject"),
+                "status": status,
+                "goal_met": status == "completed",
+            })
+
+        if all_done and tasks:
+            overall = all(t["goal_met"] for t in tasks)
+            result = {
+                "team": team,
+                "tasks": tasks,
+                "overall_goal_met": overall,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if overall else 1
+
+        if timeout > 0 and (time.monotonic() - start_time) > timeout:
+            overall = all(t["goal_met"] for t in tasks)
+            result = {
+                "team": team,
+                "tasks": tasks,
+                "overall_goal_met": False,
+                "error": "timeout",
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1
+
+        time.sleep(interval)
+
+
 def cmd_tail(args: argparse.Namespace) -> int:
     home = _default_home()
     p = _ensure_init(home)
@@ -1155,6 +1230,8 @@ def _add_common_exec_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--watch", action="store_false", dest="headless", help="Use interactive codex with full TUI (default).")
     sp.add_argument("--worktree", action="store_true", default=None, dest="worktree", help="Force git worktree isolation for this run.")
     sp.add_argument("--no-worktree", action="store_false", dest="worktree", help="Disable git worktree even if enabled in config.")
+    sp.add_argument("--no-pane", action="store_true", default=False, help="Run as detached subprocess instead of tmux pane (for headless mode).")
+    sp.add_argument("--tmux-window", default=None, help="tmux window index.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1213,6 +1290,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("tail", help="Tail orchestrator notifications (like tail -f).")
     sp.set_defaults(func=cmd_tail)
+
+    sp = sub.add_parser("aggregate", help="Wait for all team tasks to complete, output aggregated JSON.")
+    sp.add_argument("--team", required=True, help="Team name to aggregate results for.")
+    sp.add_argument("--timeout", type=float, default=3600, help="Max seconds to wait (default: 3600).")
+    sp.add_argument("--interval", type=float, default=5, help="Poll interval in seconds (default: 5).")
+    sp.set_defaults(func=cmd_aggregate)
 
     return p
 

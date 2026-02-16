@@ -71,24 +71,31 @@ Bash (run_in_background: true): python3 <agentctl> wait <run_id3>
 For tasks requiring tool use, MCP integrations, multi-turn reasoning, browser automation.
 Launched through the standard Claude Code teams mechanism.
 
-### Codex bridge worker (via codex-bridge daemon)
+### Bridge workers (via codex-bridge or claude-bridge daemon)
 For quick edits, bulk operations, parallel code work.
-The bridge is an external process that polls the task list and executes tasks via agentctl.
+The bridge is an external process that polls the task list and executes tasks automatically.
+
+Two bridge engines are available:
+- **codex-bridge**: Uses Codex CLI via agentctl. Best for quick edits, bulk operations.
+- **claude-bridge**: Uses Claude Code CLI (`claude -p`). Best for tasks needing Claude's capabilities without MCP/tool use.
+
+Select the bridge engine when launching: `orch --bridge --bridge-engine codex|claude`
 
 Working with the bridge:
 ```
-# Bridge is already running: codex-bridge join --team <team> --name codex-worker --project <proj>
+# Bridge is already running (started by orch --bridge)
+# Worker name depends on engine: "codex-worker" or "claude-worker"
 
 # Just create a task with owner — the bridge picks it up automatically:
 TaskCreate(subject="Fix null check in auth.ts", description="...", owner="codex-worker")
 
 # The result will arrive in your inbox automatically.
-# For complex tasks the bridge will switch to the deep profile on its own.
+# For complex tasks the bridge will auto-select a more powerful profile/model.
 ```
 
 When to use bridge vs teammate:
-- **Bridge**: quick edits, lint/format, simple bug fixes, boilerplate generation
-- **Teammate**: tasks requiring dialogue, tool use, MCP access, complex logic
+- **Bridge**: quick edits, lint/format, simple bug fixes, boilerplate generation, parallel code work
+- **Teammate**: tasks requiring dialogue, tool use, MCP access, complex multi-turn logic
 
 ## Git worktree isolation
 
